@@ -1,0 +1,9 @@
+{
+  "table": "ipc_embeddings",
+  "queries": 200,
+  "k": 100,
+  "ef_search": 100,
+  "mean_recall_at_k": 0.55345,
+  "min_recall_at_k": 0.0,
+  "note": "ANN fidelity vs exact search only; not a measure of correct IPC classification."
+}

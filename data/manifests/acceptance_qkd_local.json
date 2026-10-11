@@ -1,0 +1,619 @@
+{
+  "status": "needs_review",
+  "taxonomy_version": "20260101",
+  "field_of_invention": {
+    "label": "COMMUNICATION",
+    "mapping_key": "H04",
+    "mapping_version": "1",
+    "additional_labels": [],
+    "rationale": "Primary supported candidate H04L 9/08 (Key distribution) is in class H04 (ELECTRIC COMMUNICATION TECHNIQUE); mapped via field mapping v1."
+  },
+  "summary": {
+    "field_of_invention": "COMMUNICATION",
+    "classification_lines": [
+      {
+        "display_code": "H04L 9/08",
+        "confidence_text": "confidence: not calibrated"
+      }
+    ],
+    "classification_cell_text": "H04L 9/08 — confidence: not calibrated",
+    "markdown": "| Field Of Invention | COMMUNICATION |\n| :--- | :--- |\n| Classification (IPC) | H04L 9/08 — confidence: not calibrated |\n"
+  },
+  "candidates": [
+    {
+      "code": "H04L0009080000",
+      "display_code": "H04L 9/08",
+      "title": "Key distribution",
+      "original_title": "Key distribution",
+      "level": "subgroup",
+      "confidence": {
+        "score": null,
+        "status": "not_calibrated",
+        "calibrator_id": null,
+        "interpretation": null,
+        "detail": "No validated calibrator artifact is active."
+      },
+      "supporting_passages": [
+        {
+          "source": "abstract",
+          "quote": "The present invention discloses a Quantum Key Distribution (QKD) protocol for multi-node smart grid encryption configured to provide secure cryptographic key generation, distribution, management, and renewal among a plurality of interconnected smart grid nodes.",
+          "start": 0,
+          "end": 261,
+          "claim_number": null,
+          "section": null,
+          "evidence_type": "retrieval_evidence_requires_review",
+          "relevance": -1.9434
+        }
+      ],
+      "depends_on_optional_documents": false,
+      "rationale": "The abstract passage shares the defining terms (key, distribution) of H04L 9/08 \"Key distribution\" within Arrangements for secret or secure communications; Network security protocols; ranked by the cross-encoder against the candidate's scope wording.",
+      "unresolved_ambiguity": [
+        "Retrieval evidence requiring review: sentence similarity does not prove that all classification conditions are met.",
+        "Abstract-only candidate review; applicable scope notes and priority rules still need verification against the official scheme."
+      ],
+      "missing_defining_terms": [],
+      "parent_path": [
+        {
+          "code": "H",
+          "display_code": "H",
+          "title": "ELECTRICITY",
+          "level": "section"
+        },
+        {
+          "code": "H04",
+          "display_code": "H04",
+          "title": "ELECTRIC COMMUNICATION TECHNIQUE",
+          "level": "class"
+        },
+        {
+          "code": "H04L",
+          "display_code": "H04L",
+          "title": "TRANSMISSION OF DIGITAL INFORMATION, e.g. TELEGRAPHIC COMMUNICATION",
+          "level": "subclass"
+        },
+        {
+          "code": "H04L0009000000",
+          "display_code": "H04L 9/00",
+          "title": "Arrangements for secret or secure communications; Network security protocols",
+          "level": "maingroup"
+        }
+      ],
+      "references": [],
+      "scores": {
+        "cosine_similarity": 0.512400235951211,
+        "keyword_rank": 93,
+        "keyword_score": 0.45759946,
+        "vector_rank": 64,
+        "rrf_score": 0.01460046384145056,
+        "fused_rank": 22,
+        "reranker_score": -0.2452392578125,
+        "reranker_source": "abstract"
+      },
+      "origin": [
+        "keyword:abstract",
+        "vector:abstract"
+      ]
+    }
+  ],
+  "alternatives": [
+    {
+      "code": "H04W0012043300",
+      "display_code": "H04W 12/0433",
+      "title": "Key management protocols",
+      "level": "subgroup",
+      "reason": "Subclass scope (H04W: WIRELESS COMMUNICATION NETWORKS) not evidenced; none of its distinctive terms appear in the reviewed text: wireless.",
+      "unresolved_ambiguity": [],
+      "supporting_passages": [
+        {
+          "source": "abstract",
+          "quote": "The present invention discloses a Quantum Key Distribution (QKD) protocol for multi-node smart grid encryption configured to provide secure cryptographic key generation, distribution, management, and renewal among a plurality of interconnected smart grid nodes.",
+          "start": 0,
+          "end": 261,
+          "claim_number": null,
+          "section": null,
+          "evidence_type": "retrieval_evidence_requires_review",
+          "relevance": -2.7051
+        }
+      ],
+      "confidence": {
+        "score": null,
+        "status": "not_calibrated",
+        "calibrator_id": null,
+        "interpretation": null,
+        "detail": "No validated calibrator artifact is active."
+      },
+      "scores": {
+        "cosine_similarity": 0.5253215948263396,
+        "keyword_rank": 86,
+        "keyword_score": 0.4616624,
+        "vector_rank": 24,
+        "rrf_score": 0.018754076973255054,
+        "fused_rank": 4,
+        "reranker_score": 1.111328125,
+        "reranker_source": "abstract"
+      }
+    },
+    {
+      "code": "H04W0012041000",
+      "display_code": "H04W 12/041",
+      "title": "Key generation or derivation",
+      "level": "subgroup",
+      "reason": "Subclass scope (H04W: WIRELESS COMMUNICATION NETWORKS) not evidenced; none of its distinctive terms appear in the reviewed text: wireless.",
+      "unresolved_ambiguity": [],
+      "supporting_passages": [
+        {
+          "source": "abstract",
+          "quote": "The present invention discloses a Quantum Key Distribution (QKD) protocol for multi-node smart grid encryption configured to provide secure cryptographic key generation, distribution, management, and renewal among a plurality of interconnected smart grid nodes.",
+          "start": 0,
+          "end": 261,
+          "claim_number": null,
+          "section": null,
+          "evidence_type": "retrieval_evidence_requires_review",
+          "relevance": -2.1641
+        }
+      ],
+      "confidence": {
+        "score": null,
+        "status": "not_calibrated",
+        "calibrator_id": null,
+        "interpretation": null,
+        "detail": "No validated calibrator artifact is active."
+      },
+      "scores": {
+        "cosine_similarity": 0.515608795323791,
+        "keyword_rank": 85,
+        "keyword_score": 0.4616624,
+        "vector_rank": 53,
+        "rrf_score": 0.015746109246261825,
+        "fused_rank": 11,
+        "reranker_score": 0.4716796875,
+        "reranker_source": "abstract"
+      }
+    },
+    {
+      "code": "H04L0027180000",
+      "display_code": "H04L 27/18",
+      "title": "Phase-modulated carrier systems, i.e. using phase-shift keying",
+      "level": "subgroup",
+      "reason": "No supporting passage met the evidence policy.",
+      "unresolved_ambiguity": [],
+      "supporting_passages": [
+        {
+          "source": "abstract",
+          "quote": "The system comprises smart meters, substations, intelligent electronic devices, phasor measurement units, renewable energy systems, energy storage units, electric vehicle charging stations, and control centers interconnected through communication networks.",
+          "start": 262,
+          "end": 518,
+          "claim_number": null,
+          "section": null,
+          "evidence_type": "retrieval_evidence_requires_review",
+          "relevance": -4.7148
+        }
+      ],
+      "confidence": {
+        "score": null,
+        "status": "not_calibrated",
+        "calibrator_id": null,
+        "interpretation": null,
+        "detail": "No validated calibrator artifact is active."
+      },
+      "scores": {
+        "cosine_similarity": 0.5312262892431924,
+        "keyword_rank": null,
+        "keyword_score": null,
+        "vector_rank": 11,
+        "rrf_score": 0.014084507042253521,
+        "fused_rank": 28,
+        "reranker_score": 0.394775390625,
+        "reranker_source": "abstract"
+      }
+    },
+    {
+      "code": "H04N0021000000",
+      "display_code": "H04N 21/00",
+      "title": "Selective content distribution, e.g. interactive television or video on demand [VOD]",
+      "level": "maingroup",
+      "reason": "No supporting passage met the evidence policy.",
+      "unresolved_ambiguity": [],
+      "supporting_passages": [
+        {
+          "source": "abstract",
+          "quote": "The present invention discloses a Quantum Key Distribution (QKD) protocol for multi-node smart grid encryption configured to provide secure cryptographic key generation, distribution, management, and renewal among a plurality of interconnected smart grid nodes.",
+          "start": 0,
+          "end": 261,
+          "claim_number": null,
+          "section": null,
+          "evidence_type": "retrieval_evidence_requires_review",
+          "relevance": -5.6875
+        }
+      ],
+      "confidence": {
+        "score": null,
+        "status": "not_calibrated",
+        "calibrator_id": null,
+        "interpretation": null,
+        "detail": "No validated calibrator artifact is active."
+      },
+      "scores": {
+        "cosine_similarity": null,
+        "keyword_rank": null,
+        "keyword_score": null,
+        "vector_rank": null,
+        "rrf_score": null,
+        "fused_rank": null,
+        "reranker_score": -0.323486328125,
+        "reranker_source": "abstract"
+      }
+    },
+    {
+      "code": "H04W0012047100",
+      "display_code": "H04W 12/0471",
+      "title": "Key exchange",
+      "level": "subgroup",
+      "reason": "Subclass scope (H04W: WIRELESS COMMUNICATION NETWORKS) not evidenced; none of its distinctive terms appear in the reviewed text: wireless.",
+      "unresolved_ambiguity": [],
+      "supporting_passages": [
+        {
+          "source": "abstract",
+          "quote": "Quantum communication channels are utilized to exchange quantum states between authorized nodes for generating shared secret key material, while authenticated classical communication channels support basis reconciliation, parameter estimation, error correction, privacy amplification, and key validation.",
+          "start": 519,
+          "end": 823,
+          "claim_number": null,
+          "section": null,
+          "evidence_type": "retrieval_evidence_requires_review",
+          "relevance": -2.7422
+        }
+      ],
+      "confidence": {
+        "score": null,
+        "status": "not_calibrated",
+        "calibrator_id": null,
+        "interpretation": null,
+        "detail": "No validated calibrator artifact is active."
+      },
+      "scores": {
+        "cosine_similarity": 0.5137656752770267,
+        "keyword_rank": 78,
+        "keyword_score": 0.47515872,
+        "vector_rank": 61,
+        "rrf_score": 0.01551083962151156,
+        "fused_rank": 14,
+        "reranker_score": -0.398193359375,
+        "reranker_source": "abstract"
+      }
+    },
+    {
+      "code": "H04W0012043100",
+      "display_code": "H04W 12/0431",
+      "title": "Key distribution or pre-distribution; Key agreement",
+      "level": "subgroup",
+      "reason": "Subclass scope (H04W: WIRELESS COMMUNICATION NETWORKS) not evidenced; none of its distinctive terms appear in the reviewed text: wireless.",
+      "unresolved_ambiguity": [],
+      "supporting_passages": [
+        {
+          "source": "abstract",
+          "quote": "The present invention discloses a Quantum Key Distribution (QKD) protocol for multi-node smart grid encryption configured to provide secure cryptographic key generation, distribution, management, and renewal among a plurality of interconnected smart grid nodes.",
+          "start": 0,
+          "end": 261,
+          "claim_number": null,
+          "section": null,
+          "evidence_type": "retrieval_evidence_requires_review",
+          "relevance": -2.2266
+        }
+      ],
+      "confidence": {
+        "score": null,
+        "status": "not_calibrated",
+        "calibrator_id": null,
+        "interpretation": null,
+        "detail": "No validated calibrator artifact is active."
+      },
+      "scores": {
+        "cosine_similarity": 0.5275173937879052,
+        "keyword_rank": 18,
+        "keyword_score": 0.8456236,
+        "vector_rank": 21,
+        "rrf_score": 0.0251661918328585,
+        "fused_rank": 3,
+        "reranker_score": -0.7978515625,
+        "reranker_source": "abstract"
+      }
+    },
+    {
+      "code": "H04L0009140000",
+      "display_code": "H04L 9/14",
+      "title": "using a plurality of keys or algorithms",
+      "level": "subgroup",
+      "reason": "Defining feature(s) of this subgroup not found in the reviewed text: algorithms.",
+      "unresolved_ambiguity": [],
+      "supporting_passages": [
+        {
+          "source": "abstract",
+          "quote": "The present invention discloses a Quantum Key Distribution (QKD) protocol for multi-node smart grid encryption configured to provide secure cryptographic key generation, distribution, management, and renewal among a plurality of interconnected smart grid nodes.",
+          "start": 0,
+          "end": 261,
+          "claim_number": null,
+          "section": null,
+          "evidence_type": "retrieval_evidence_requires_review",
+          "relevance": -1.6387
+        }
+      ],
+      "confidence": {
+        "score": null,
+        "status": "not_calibrated",
+        "calibrator_id": null,
+        "interpretation": null,
+        "detail": "No validated calibrator artifact is active."
+      },
+      "scores": {
+        "cosine_similarity": 0.5446604520406104,
+        "keyword_rank": null,
+        "keyword_score": null,
+        "vector_rank": 2,
+        "rrf_score": 0.016129032258064516,
+        "fused_rank": 9,
+        "reranker_score": -0.92724609375,
+        "reranker_source": "abstract"
+      }
+    },
+    {
+      "code": "H04L0027100000",
+      "display_code": "H04L 27/10",
+      "title": "Frequency-modulated carrier systems, i.e. using frequency-shift keying",
+      "level": "subgroup",
+      "reason": "No supporting passage met the evidence policy.",
+      "unresolved_ambiguity": [],
+      "supporting_passages": [
+        {
+          "source": "abstract",
+          "quote": "The system comprises smart meters, substations, intelligent electronic devices, phasor measurement units, renewable energy systems, energy storage units, electric vehicle charging stations, and control centers interconnected through communication networks.",
+          "start": 262,
+          "end": 518,
+          "claim_number": null,
+          "section": null,
+          "evidence_type": "retrieval_evidence_requires_review",
+          "relevance": -4.8516
+        }
+      ],
+      "confidence": {
+        "score": null,
+        "status": "not_calibrated",
+        "calibrator_id": null,
+        "interpretation": null,
+        "detail": "No validated calibrator artifact is active."
+      },
+      "scores": {
+        "cosine_similarity": 0.5383135264918538,
+        "keyword_rank": null,
+        "keyword_score": null,
+        "vector_rank": 6,
+        "rrf_score": 0.015151515151515152,
+        "fused_rank": 18,
+        "reranker_score": -0.92919921875,
+        "reranker_source": "abstract"
+      }
+    },
+    {
+      "code": "H04L0009280000",
+      "display_code": "H04L 9/28",
+      "title": "using particular encryption algorithm",
+      "level": "subgroup",
+      "reason": "No supporting passage met the evidence policy.",
+      "unresolved_ambiguity": [],
+      "supporting_passages": [
+        {
+          "source": "abstract",
+          "quote": "The present invention discloses a Quantum Key Distribution (QKD) protocol for multi-node smart grid encryption configured to provide secure cryptographic key generation, distribution, management, and renewal among a plurality of interconnected smart grid nodes.",
+          "start": 0,
+          "end": 261,
+          "claim_number": null,
+          "section": null,
+          "evidence_type": "retrieval_evidence_requires_review",
+          "relevance": -3.0879
+        }
+      ],
+      "confidence": {
+        "score": null,
+        "status": "not_calibrated",
+        "calibrator_id": null,
+        "interpretation": null,
+        "detail": "No validated calibrator artifact is active."
+      },
+      "scores": {
+        "cosine_similarity": null,
+        "keyword_rank": null,
+        "keyword_score": null,
+        "vector_rank": null,
+        "rrf_score": null,
+        "fused_rank": null,
+        "reranker_score": -0.9677734375,
+        "reranker_source": "abstract"
+      }
+    }
+  ],
+  "input_coverage": {
+    "abstract": "complete",
+    "specification": "not_supplied",
+    "claims": "not_supplied",
+    "details": {}
+  },
+  "extracted_terms": [
+    {
+      "term": "smart grid",
+      "source": "abstract",
+      "weight": 8.0
+    },
+    {
+      "term": "multi-node smart grid",
+      "source": "abstract",
+      "weight": 4.4
+    },
+    {
+      "term": "smart grid communications",
+      "source": "abstract",
+      "weight": 4.4
+    },
+    {
+      "term": "key",
+      "source": "abstract",
+      "weight": 8.0
+    },
+    {
+      "term": "multi-node smart",
+      "source": "abstract",
+      "weight": 3.2
+    },
+    {
+      "term": "cryptographic key",
+      "source": "abstract",
+      "weight": 3.2
+    },
+    {
+      "term": "communication channels",
+      "source": "abstract",
+      "weight": 3.2
+    },
+    {
+      "term": "grid communications",
+      "source": "abstract",
+      "weight": 3.2
+    },
+    {
+      "term": "quantum",
+      "source": "abstract",
+      "weight": 5.0
+    },
+    {
+      "term": "quantum key distribution",
+      "source": "abstract",
+      "weight": 2.2
+    },
+    {
+      "term": "smart grid encryption",
+      "source": "abstract",
+      "weight": 2.2
+    },
+    {
+      "term": "secure cryptographic key",
+      "source": "abstract",
+      "weight": 2.2
+    },
+    {
+      "term": "cryptographic key generation",
+      "source": "abstract",
+      "weight": 2.2
+    },
+    {
+      "term": "interconnected smart grid",
+      "source": "abstract",
+      "weight": 2.2
+    },
+    {
+      "term": "smart grid nodes",
+      "source": "abstract",
+      "weight": 2.2
+    },
+    {
+      "term": "intelligent electronic devices",
+      "source": "abstract",
+      "weight": 2.2
+    },
+    {
+      "term": "phasor measurement units",
+      "source": "abstract",
+      "weight": 2.2
+    },
+    {
+      "term": "renewable energy systems",
+      "source": "abstract",
+      "weight": 2.2
+    },
+    {
+      "term": "energy storage units",
+      "source": "abstract",
+      "weight": 2.2
+    },
+    {
+      "term": "electric vehicle charging",
+      "source": "abstract",
+      "weight": 2.2
+    },
+    {
+      "term": "vehicle charging stations",
+      "source": "abstract",
+      "weight": 2.2
+    },
+    {
+      "term": "control centers interconnected",
+      "source": "abstract",
+      "weight": 2.2
+    },
+    {
+      "term": "quantum communication channels",
+      "source": "abstract",
+      "weight": 2.2
+    },
+    {
+      "term": "exchange quantum states",
+      "source": "abstract",
+      "weight": 2.2
+    }
+  ],
+  "warnings": [
+    "Abstract-only inference: not an official classification; scope and rule checks need review.",
+    "Confidence: not calibrated — no validated calibrator is active for this pipeline; numeric confidence is null."
+  ],
+  "degraded_mode": null,
+  "provenance": {
+    "taxonomy_version": "20260101",
+    "source_snapshot": {
+      "tree": "81aaefb9c5386799814b3f5f71cbd2df9692eb268a4aca68a55c2f75cf9aa990",
+      "index": "3467306e31c5e2df3b5d32d6722c949f55d692f0bd7f76dc9b249689744dcd09",
+      "duplicates": "a591e5b6637c539db7bdffde8d7db5e53844ab175be423bb09f53e2499f6fa49"
+    },
+    "embedding_provider": "bge_m3",
+    "embedding_model": "BAAI/bge-m3",
+    "model_revision": "5617a9f61b028005a4858fdac845db406aefb181",
+    "embedding_run_id": "emb-bge_m3-72c8b3da25a4",
+    "reranker_model": "BAAI/bge-reranker-v2-m3",
+    "reranker_revision": "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e",
+    "scope_formatter": "scope-v1",
+    "calibrator_id": null,
+    "field_mapping_version": "1",
+    "llm_model": null,
+    "retrieval_settings": {
+      "vector_pool": 100,
+      "keyword_pool": 100,
+      "rerank_pool": 100,
+      "rrf_k": 60,
+      "hnsw_ef_search": 500,
+      "vector_search_mode": "hnsw",
+      "keyword_max_terms": 24,
+      "expansion_top_n": 20,
+      "expansion_max_siblings": 4,
+      "max_query_views": 24,
+      "per_source_candidate_cap": 100,
+      "keyword_mode": "postgresql_fulltext_ts_rank_cd",
+      "fusion": "rrf_two_level_equal_source_caps",
+      "min_reranker_score": -1.0,
+      "max_reranker_gap": 1.5,
+      "min_evidence_score": -3.0
+    },
+    "encoding_policy": {
+      "dimension": 1024,
+      "normalized": true,
+      "dtype": "float16",
+      "taxonomy_max_tokens": 512,
+      "query_chunk_tokens": 1024,
+      "abstract_max_tokens": 2048,
+      "query_template": "{text}",
+      "document_template": "{semantic_text}"
+    }
+  },
+  "timings_ms": {
+    "encode": 607.8,
+    "retrieve": 502.1,
+    "rerank": 6038.0,
+    "evidence": 2222.5,
+    "total": 9406.9
+  }
+}

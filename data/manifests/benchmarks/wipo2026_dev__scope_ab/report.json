@@ -1,0 +1,116 @@
+{
+  "experiment": "Offline reranker scope A/B on the dev set (ipindia_2026-09, 130 docs)",
+  "date": "2026-10-11",
+  "candidates": "each document's devA ranked list (wipo2026_dev__abstract/results.jsonl), top 100; only the reranker scope text varies",
+  "reranker": "BAAI/bge-reranker-v2-m3, max_length 1024, pair = (scope text, title + newline + abstract)",
+  "variants": {
+    "full": "format_scope scope-v3, official=True, 6 references",
+    "no_official": "format_scope official=False, 6 references (adopted default RERANK_OFFICIAL_CONTEXT=false)",
+    "path_only": "format_scope official=False, 0 references",
+    "compact_own_notes": "path_only plus the candidate's own WIPO notes only, capped at 600 chars"
+  },
+  "policy_replay": "benchmark.simulate_policy (hierarchy fix) over each variant's new top 20; evidence scores reused from devA; a candidate without a recorded evidence score is assumed to pass (count in top1_on_assumed_evidence); rules not replayed",
+  "results_pct": {
+    "full": {
+      "policy_top1": [
+        30.8,
+        18.5,
+        6.2
+      ],
+      "h@1": [
+        29.2,
+        16.9,
+        6.2
+      ],
+      "h@3": [
+        44.6,
+        29.2,
+        10.8
+      ],
+      "h@10": [
+        66.2,
+        43.1,
+        23.8
+      ],
+      "median_rerank_s": 9.36,
+      "top1_on_assumed_evidence": 0
+    },
+    "no_official": {
+      "policy_top1": [
+        41.5,
+        22.3,
+        10.0
+      ],
+      "h@1": [
+        40.0,
+        20.0,
+        8.5
+      ],
+      "h@3": [
+        58.5,
+        38.5,
+        22.3
+      ],
+      "h@10": [
+        75.4,
+        54.6,
+        32.3
+      ],
+      "median_rerank_s": 4.37,
+      "top1_on_assumed_evidence": 36
+    },
+    "path_only": {
+      "policy_top1": [
+        42.3,
+        21.5,
+        13.1
+      ],
+      "h@1": [
+        42.3,
+        21.5,
+        13.1
+      ],
+      "h@3": [
+        56.9,
+        38.5,
+        23.1
+      ],
+      "h@10": [
+        74.6,
+        53.1,
+        33.1
+      ],
+      "median_rerank_s": 3.88,
+      "top1_on_assumed_evidence": 41
+    },
+    "compact_own_notes": {
+      "policy_top1": [
+        26.9,
+        14.6,
+        6.2
+      ],
+      "h@1": [
+        26.9,
+        14.6,
+        6.2
+      ],
+      "h@3": [
+        49.2,
+        33.1,
+        15.4
+      ],
+      "h@10": [
+        70.0,
+        48.5,
+        33.1
+      ],
+      "median_rerank_s": 4.53,
+      "top1_on_assumed_evidence": 40
+    }
+  },
+  "levels": "[subclass, main group, exact]; truth = all recorded IPC symbols parsed from ground_truth (not filtered to catalogue presence)",
+  "files": {
+    "rows.jsonl": "per document: n_candidates and, per variant, the new top-20 order and every candidate's reranker score",
+    "rerank_scope_ab.py": "the script that produced them (run from apps/api with IPC_DB_TARGET=sakthi)"
+  }
+}

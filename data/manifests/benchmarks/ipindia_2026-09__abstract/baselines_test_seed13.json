@@ -1,0 +1,500 @@
+{
+  "top1_always": {
+    "documents": 88,
+    "abstained": {
+      "k": 0,
+      "n": 88,
+      "rate": 0.0,
+      "ci95": [
+        0.0,
+        0.042
+      ]
+    },
+    "subclass": {
+      "documents_with_truth_at_level": 88,
+      "top1_all_documents": {
+        "k": 34,
+        "n": 88,
+        "rate": 0.386,
+        "ci95": [
+          0.291,
+          0.491
+        ]
+      },
+      "top1_answered_only": {
+        "k": 34,
+        "n": 88,
+        "rate": 0.386,
+        "ci95": [
+          0.291,
+          0.491
+        ]
+      },
+      "any_supported_all_documents": {
+        "k": 34,
+        "n": 88,
+        "rate": 0.386,
+        "ci95": [
+          0.291,
+          0.491
+        ]
+      },
+      "first_recorded_symbol_in_supported": {
+        "k": 23,
+        "n": 88,
+        "rate": 0.261,
+        "ci95": [
+          0.181,
+          0.362
+        ]
+      },
+      "mean_precision_answered": 0.386,
+      "mean_recall_all_documents": 0.205,
+      "candidate_hit@1": {
+        "k": 34,
+        "n": 88,
+        "rate": 0.386,
+        "ci95": [
+          0.291,
+          0.491
+        ]
+      },
+      "candidate_hit@3": {
+        "k": 50,
+        "n": 88,
+        "rate": 0.568,
+        "ci95": [
+          0.464,
+          0.667
+        ]
+      },
+      "candidate_hit@5": {
+        "k": 54,
+        "n": 88,
+        "rate": 0.614,
+        "ci95": [
+          0.509,
+          0.709
+        ]
+      },
+      "candidate_hit@10": {
+        "k": 65,
+        "n": 88,
+        "rate": 0.739,
+        "ci95": [
+          0.638,
+          0.819
+        ]
+      }
+    },
+    "maingroup": {
+      "documents_with_truth_at_level": 88,
+      "top1_all_documents": {
+        "k": 19,
+        "n": 88,
+        "rate": 0.216,
+        "ci95": [
+          0.143,
+          0.313
+        ]
+      },
+      "top1_answered_only": {
+        "k": 19,
+        "n": 88,
+        "rate": 0.216,
+        "ci95": [
+          0.143,
+          0.313
+        ]
+      },
+      "any_supported_all_documents": {
+        "k": 19,
+        "n": 88,
+        "rate": 0.216,
+        "ci95": [
+          0.143,
+          0.313
+        ]
+      },
+      "first_recorded_symbol_in_supported": {
+        "k": 9,
+        "n": 88,
+        "rate": 0.102,
+        "ci95": [
+          0.055,
+          0.183
+        ]
+      },
+      "mean_precision_answered": 0.216,
+      "mean_recall_all_documents": 0.078,
+      "candidate_hit@1": {
+        "k": 19,
+        "n": 88,
+        "rate": 0.216,
+        "ci95": [
+          0.143,
+          0.313
+        ]
+      },
+      "candidate_hit@3": {
+        "k": 32,
+        "n": 88,
+        "rate": 0.364,
+        "ci95": [
+          0.271,
+          0.468
+        ]
+      },
+      "candidate_hit@5": {
+        "k": 36,
+        "n": 88,
+        "rate": 0.409,
+        "ci95": [
+          0.312,
+          0.514
+        ]
+      },
+      "candidate_hit@10": {
+        "k": 45,
+        "n": 88,
+        "rate": 0.511,
+        "ci95": [
+          0.409,
+          0.613
+        ]
+      }
+    },
+    "exact": {
+      "documents_with_truth_at_level": 88,
+      "top1_all_documents": {
+        "k": 12,
+        "n": 88,
+        "rate": 0.136,
+        "ci95": [
+          0.08,
+          0.223
+        ]
+      },
+      "top1_answered_only": {
+        "k": 12,
+        "n": 88,
+        "rate": 0.136,
+        "ci95": [
+          0.08,
+          0.223
+        ]
+      },
+      "any_supported_all_documents": {
+        "k": 12,
+        "n": 88,
+        "rate": 0.136,
+        "ci95": [
+          0.08,
+          0.223
+        ]
+      },
+      "first_recorded_symbol_in_supported": {
+        "k": 5,
+        "n": 88,
+        "rate": 0.057,
+        "ci95": [
+          0.025,
+          0.126
+        ]
+      },
+      "mean_precision_answered": 0.136,
+      "mean_recall_all_documents": 0.037,
+      "candidate_hit@1": {
+        "k": 12,
+        "n": 88,
+        "rate": 0.136,
+        "ci95": [
+          0.08,
+          0.223
+        ]
+      },
+      "candidate_hit@3": {
+        "k": 21,
+        "n": 88,
+        "rate": 0.239,
+        "ci95": [
+          0.162,
+          0.337
+        ]
+      },
+      "candidate_hit@5": {
+        "k": 24,
+        "n": 88,
+        "rate": 0.273,
+        "ci95": [
+          0.191,
+          0.374
+        ]
+      },
+      "candidate_hit@10": {
+        "k": 28,
+        "n": 88,
+        "rate": 0.318,
+        "ci95": [
+          0.23,
+          0.421
+        ]
+      }
+    },
+    "field_of_invention_class_match": {
+      "k": 0,
+      "n": 0,
+      "rate": null,
+      "ci95": null
+    }
+  },
+  "top3_always": {
+    "documents": 88,
+    "abstained": {
+      "k": 0,
+      "n": 88,
+      "rate": 0.0,
+      "ci95": [
+        0.0,
+        0.042
+      ]
+    },
+    "subclass": {
+      "documents_with_truth_at_level": 88,
+      "top1_all_documents": {
+        "k": 34,
+        "n": 88,
+        "rate": 0.386,
+        "ci95": [
+          0.291,
+          0.491
+        ]
+      },
+      "top1_answered_only": {
+        "k": 34,
+        "n": 88,
+        "rate": 0.386,
+        "ci95": [
+          0.291,
+          0.491
+        ]
+      },
+      "any_supported_all_documents": {
+        "k": 45,
+        "n": 88,
+        "rate": 0.511,
+        "ci95": [
+          0.409,
+          0.613
+        ]
+      },
+      "first_recorded_symbol_in_supported": {
+        "k": 32,
+        "n": 88,
+        "rate": 0.364,
+        "ci95": [
+          0.271,
+          0.468
+        ]
+      },
+      "mean_precision_answered": 0.377,
+      "mean_recall_all_documents": 0.295,
+      "candidate_hit@1": {
+        "k": 34,
+        "n": 88,
+        "rate": 0.386,
+        "ci95": [
+          0.291,
+          0.491
+        ]
+      },
+      "candidate_hit@3": {
+        "k": 50,
+        "n": 88,
+        "rate": 0.568,
+        "ci95": [
+          0.464,
+          0.667
+        ]
+      },
+      "candidate_hit@5": {
+        "k": 54,
+        "n": 88,
+        "rate": 0.614,
+        "ci95": [
+          0.509,
+          0.709
+        ]
+      },
+      "candidate_hit@10": {
+        "k": 65,
+        "n": 88,
+        "rate": 0.739,
+        "ci95": [
+          0.638,
+          0.819
+        ]
+      }
+    },
+    "maingroup": {
+      "documents_with_truth_at_level": 88,
+      "top1_all_documents": {
+        "k": 19,
+        "n": 88,
+        "rate": 0.216,
+        "ci95": [
+          0.143,
+          0.313
+        ]
+      },
+      "top1_answered_only": {
+        "k": 19,
+        "n": 88,
+        "rate": 0.216,
+        "ci95": [
+          0.143,
+          0.313
+        ]
+      },
+      "any_supported_all_documents": {
+        "k": 30,
+        "n": 88,
+        "rate": 0.341,
+        "ci95": [
+          0.25,
+          0.445
+        ]
+      },
+      "first_recorded_symbol_in_supported": {
+        "k": 19,
+        "n": 88,
+        "rate": 0.216,
+        "ci95": [
+          0.143,
+          0.313
+        ]
+      },
+      "mean_precision_answered": 0.214,
+      "mean_recall_all_documents": 0.165,
+      "candidate_hit@1": {
+        "k": 19,
+        "n": 88,
+        "rate": 0.216,
+        "ci95": [
+          0.143,
+          0.313
+        ]
+      },
+      "candidate_hit@3": {
+        "k": 32,
+        "n": 88,
+        "rate": 0.364,
+        "ci95": [
+          0.271,
+          0.468
+        ]
+      },
+      "candidate_hit@5": {
+        "k": 36,
+        "n": 88,
+        "rate": 0.409,
+        "ci95": [
+          0.312,
+          0.514
+        ]
+      },
+      "candidate_hit@10": {
+        "k": 45,
+        "n": 88,
+        "rate": 0.511,
+        "ci95": [
+          0.409,
+          0.613
+        ]
+      }
+    },
+    "exact": {
+      "documents_with_truth_at_level": 88,
+      "top1_all_documents": {
+        "k": 12,
+        "n": 88,
+        "rate": 0.136,
+        "ci95": [
+          0.08,
+          0.223
+        ]
+      },
+      "top1_answered_only": {
+        "k": 12,
+        "n": 88,
+        "rate": 0.136,
+        "ci95": [
+          0.08,
+          0.223
+        ]
+      },
+      "any_supported_all_documents": {
+        "k": 21,
+        "n": 88,
+        "rate": 0.239,
+        "ci95": [
+          0.162,
+          0.337
+        ]
+      },
+      "first_recorded_symbol_in_supported": {
+        "k": 11,
+        "n": 88,
+        "rate": 0.125,
+        "ci95": [
+          0.071,
+          0.21
+        ]
+      },
+      "mean_precision_answered": 0.114,
+      "mean_recall_all_documents": 0.079,
+      "candidate_hit@1": {
+        "k": 12,
+        "n": 88,
+        "rate": 0.136,
+        "ci95": [
+          0.08,
+          0.223
+        ]
+      },
+      "candidate_hit@3": {
+        "k": 21,
+        "n": 88,
+        "rate": 0.239,
+        "ci95": [
+          0.162,
+          0.337
+        ]
+      },
+      "candidate_hit@5": {
+        "k": 24,
+        "n": 88,
+        "rate": 0.273,
+        "ci95": [
+          0.191,
+          0.374
+        ]
+      },
+      "candidate_hit@10": {
+        "k": 28,
+        "n": 88,
+        "rate": 0.318,
+        "ci95": [
+          0.23,
+          0.421
+        ]
+      }
+    },
+    "field_of_invention_class_match": {
+      "k": 0,
+      "n": 0,
+      "rate": null,
+      "ci95": null
+    }
+  }
+}

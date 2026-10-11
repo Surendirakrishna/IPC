@@ -1,0 +1,26 @@
+{
+  "run_id": "emb-bge_m3-61c53c85a23d",
+  "storage_table": "ipc_embeddings",
+  "expected": 80145,
+  "fresh_vectors": 80145,
+  "bad_norm": 0,
+  "state": "validated",
+  "encoding_policy": {
+    "provider": "bge_m3",
+    "model_id": "BAAI/bge-m3",
+    "model_revision": "5617a9f61b028005a4858fdac845db406aefb181",
+    "dimension": 1024,
+    "storage_table": "ipc_embeddings",
+    "normalized": true,
+    "document_template": "{semantic_text}",
+    "query_template": "{text}",
+    "taxonomy_max_tokens": 512,
+    "query_chunk_tokens": 1024,
+    "dtype": "float16",
+    "extra": {
+      "device": "cuda",
+      "model_max_tokens": 8192,
+      "library": "sentence-transformers"
+    }
+  }
+}

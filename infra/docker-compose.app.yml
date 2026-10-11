@@ -1,0 +1,22 @@
+# App services (local only; not a public deployment). Uses .env for SAKTHI_DB_* etc.
+# docker compose -f infra/docker-compose.yml -f infra/docker-compose.app.yml up --build
+services:
+  api:
+    build: ../apps/api
+    env_file: ../.env
+    environment:
+      CORS_ORIGINS: '["http://localhost:3000"]'
+    volumes:
+      - ipc-models:/models
+      - ../data:/data:ro
+    ports:
+      - "8000:8000"
+  web:
+    build: ../apps/web
+    environment:
+      IPC_API_BASE_URL: http://api:8000
+    ports:
+      - "3000:3000"
+    depends_on: [api]
+volumes:
+  ipc-models:

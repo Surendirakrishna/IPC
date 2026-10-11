@@ -1,0 +1,15 @@
+{
+  "name": "sakthi",
+  "role": "primary serving database (since 2026-10-10)",
+  "host": "192.168.200.29",
+  "port": 11233,
+  "database": "ipc_db",
+  "role_name": "ipc_user",
+  "server": "PostgreSQL 18.4 powered ShaktiDB 18.4.1.0 (x86_64 Linux)",
+  "extensions": {"vector": "0.8.2", "pg_trgm": "1.6"},
+  "ipc_user_privileges": "owner of ipc_db; not superuser; cannot create databases",
+  "tls": "server ssl=off; connections use sslmode=disable (LAN only). Enable TLS on the server and set SAKTHI_DB_SSLMODE=require.",
+  "server_settings_observed": {"shared_buffers": "4GB", "maintenance_work_mem": "512MB", "max_parallel_maintenance_workers": 2},
+  "credentials": "SAKTHI_DB_PASSWORD in the git-ignored .env only",
+  "verified_at": "2026-10-10"
+}

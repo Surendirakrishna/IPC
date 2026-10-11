@@ -1,0 +1,8 @@
+{
+  "queries": 101,
+  "k": 100,
+  "mean_overlap_bge_vs_gemma_exact_top100": 0.298,
+  "min": 0.01,
+  "max": 0.81,
+  "note": "Agreement between two embedding models only; NOT a quality or accuracy measure."
+}

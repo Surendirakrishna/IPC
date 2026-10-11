@@ -1,0 +1,104 @@
+{
+  "kind": "import",
+  "job_id": "import-f2916a32-8783-471d-83ac-c9529b004e85",
+  "taxonomy_version": "20260101",
+  "release": "resumed",
+  "source_files": {
+    "index": "ipc_classification_index.jsonl",
+    "tree": "ipc_schema_tree.json",
+    "duplicates": "ipc_maingroup_duplicates.json",
+    "wipo_scheme": "wipo_ipc_scheme_20260101.zip",
+    "wipo_definitions": "wipo_ipc_definitions_20260101.zip",
+    "wipo_catchwords": "wipo_ipc_catchwordindex_20260101.zip"
+  },
+  "source_hashes": {
+    "index": "3467306e31c5e2df3b5d32d6722c949f55d692f0bd7f76dc9b249689744dcd09",
+    "tree": "81aaefb9c5386799814b3f5f71cbd2df9692eb268a4aca68a55c2f75cf9aa990",
+    "duplicates": "a591e5b6637c539db7bdffde8d7db5e53844ab175be423bb09f53e2499f6fa49",
+    "wipo_scheme": "22977dd19b2061d155b4d48558b495192418bafca8147ea15eea2e05019e4849",
+    "wipo_definitions": "d3cad4511f083170f9b8d9345ff160d8413a2c2197602cdb5572e4371be04c31",
+    "wipo_catchwords": "d6fff7db7c1b3c7d80b4cc9746ac7918062ed2d8283c619c4b15dfd54f29a183"
+  },
+  "source_root": {
+    "symbol": "IPC",
+    "title": "International Patent Classification (CPC Scheme)",
+    "version": "20260101",
+    "wipo_master_edition": "20260101",
+    "wipo_source_root": "IPCScheme",
+    "wipo_classification_entries": 78602
+  },
+  "expected_manifest": "expected_snapshot_20260101.json",
+  "rows_changed": 0,
+  "database_counts": {
+    "records": 80145,
+    "occurrences": 80734,
+    "reference_edges": 15035,
+    "official_scheme_entries": 80145,
+    "official_texts": 31171,
+    "official_catchwords": 26000
+  },
+  "complete": true,
+  "activated": false,
+  "validation": {
+    "ok": true,
+    "counts": {
+      "records": 80145,
+      "type_section": 8,
+      "type_class": 132,
+      "type_subclass": 655,
+      "type_maingroup": 7668,
+      "type_subgroup": 71682,
+      "tree_occurrences": 80734,
+      "duplicate_maingroup_entries": 589,
+      "read_errors": 0,
+      "duplicate_canonical_codes": 0,
+      "depth_by_type": {
+        "section": {
+          "1": 8
+        },
+        "class": {
+          "2": 132
+        },
+        "subclass": {
+          "3": 655
+        },
+        "maingroup": {
+          "4": 7668
+        },
+        "subgroup": {
+          "5": 71682
+        }
+      },
+      "reference_edges": 15035,
+      "tree_distinct_symbols": 80145,
+      "tree_repeated_symbols": 589,
+      "wipo_scheme_entries": 80145,
+      "wipo_classification_entries": 78602,
+      "wipo_indexing_entries": 1543,
+      "wipo_scheme_notes": 1576,
+      "wipo_scheme_references": 13261,
+      "wipo_definition_parts": 16334,
+      "wipo_catchwords": 22867,
+      "wipo_range_scoped_notes": 236,
+      "wipo_rule_kind_definition": 1217,
+      "wipo_rule_kind_indexing": 99,
+      "wipo_rule_kind_informative_reference": 6050,
+      "wipo_rule_kind_limiting_reference": 11684,
+      "wipo_rule_kind_other": 610,
+      "wipo_rule_kind_place_first": 22,
+      "wipo_rule_kind_place_last": 157,
+      "wipo_rule_kind_precedence": 3732,
+      "wipo_rule_kind_scope": 7600,
+      "wipo_precedence_rules": 3735,
+      "wipo_conditional_precedence_rules": 8
+    },
+    "findings": {},
+    "blocking": [],
+    "source_quality": [
+      "The supplied comparison tree flattens subgroups; serving parent paths are replaced from the version-matched WIPO master scheme.",
+      "The comparison tree root is titled 'International Patent Classification (CPC Scheme)'; the version-matched WIPO IPC master files supply the serving hierarchy.",
+      "WIPO IPC master files for 20260101 supply the authoritative hierarchy, classification (K) vs indexing (I) entry types, status, 1576 scheme-note paragraphs, and 16334 definition parts."
+    ]
+  },
+  "finished_at": "2026-10-11T07:18:25+00:00"
+}

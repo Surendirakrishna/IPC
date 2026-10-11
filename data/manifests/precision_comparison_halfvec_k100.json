@@ -1,0 +1,10 @@
+{
+  "queries": 101,
+  "k": 100,
+  "mean_overlap_at_10": 1.0,
+  "min_overlap_at_10": 1.0,
+  "mean_overlap_at_100": 1.0,
+  "min_overlap_at_100": 1.0,
+  "method": "exact float32 vs exact halfvec(1024) cosine top-k on the same stored BGE-M3 vectors",
+  "note": "Measures precision-induced ranking change only; not classification accuracy."
+}

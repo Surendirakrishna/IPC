@@ -1,0 +1,23 @@
+# Local PostgreSQL + pgvector for integration tests and storage measurement.
+# PostgreSQL 17, pgvector 0.8.0. Not the serving database (that is sakthi; see infra/sakthi-db.json).
+services:
+  pgvector:
+    image: pgvector/pgvector:0.8.0-pg17
+    container_name: ipc-pgvector
+    shm_size: 2gb  # parallel HNSW builds allocate maintenance_work_mem in /dev/shm
+    environment:
+      POSTGRES_USER: ipc
+      POSTGRES_PASSWORD: ipc_local_only
+      POSTGRES_DB: ipc
+    ports:
+      - "5433:5432"
+    volumes:
+      - ipc-pgdata:/var/lib/postgresql/data
+    command: ["postgres", "-c", "shared_buffers=512MB", "-c", "maintenance_work_mem=1GB"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ipc -d ipc"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+volumes:
+  ipc-pgdata:
