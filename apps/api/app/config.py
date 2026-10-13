@@ -139,12 +139,14 @@ class Settings(BaseSettings):
     # Vote parameters chosen on the IP India dev set with a 294k HUPD 2017 corpus (knn_hupd/report.json).
     neighbour_k: int = Field(default=100, ge=1, le=1000)
     neighbour_temperature: float = Field(default=0.005, gt=0)  # neighbour weight exp((s - s1) / T)
-    neighbour_beta: float = Field(default=1.0, ge=0)  # weight of secondary labels; the main label counts 1
+    # Weight of secondary labels; the main label counts 1. Above 1 a vote share could exceed 1.
+    neighbour_beta: float = Field(default=1.0, ge=0, le=1)
     # Below this vote share for the first code, the definition pipeline runs as the fallback.
     # PROVISIONAL: to be chosen on the dev set once the vote is served (offline, first-code shares under
     # 0.2 matched about as often as definition matching does).
     neighbour_min_vote_share: float = Field(default=0.2, ge=0, le=1)
-    patent_hnsw_ef_search: int = Field(default=200, ge=1)  # must be >= neighbour_k (checked below)
+    # pgvector caps hnsw.ef_search at 1000; must also be >= neighbour_k (checked below).
+    patent_hnsw_ef_search: int = Field(default=200, ge=1, le=1000)
     uspto_odp_api_key: SecretStr | None = None  # USPTO Open Data Portal; only needed to load USPTO grants
     hupd_data_dir: Path = Path("D:/ipc_knn/raw/data")  # HUPD year tarballs (YYYY.tar.gz)
 

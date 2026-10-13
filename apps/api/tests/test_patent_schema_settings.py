@@ -92,6 +92,26 @@ def test_patent_settings_reject_out_of_range(clean_env: pytest.MonkeyPatch, name
         Settings(_env_file=None)
 
 
+def test_neighbour_beta_is_at_most_one(clean_env: pytest.MonkeyPatch) -> None:
+    # Contract VoteSettings.beta is le=1: a secondary label weighing more than the main one would push
+    # vote shares above 1.
+    clean_env.setenv("NEIGHBOUR_BETA", "1.5")
+    with pytest.raises(ValidationError, match="neighbour_beta"):
+        Settings(_env_file=None)
+    clean_env.setenv("NEIGHBOUR_BETA", "1")
+    assert Settings(_env_file=None).neighbour_beta == 1.0
+    clean_env.setenv("NEIGHBOUR_BETA", "0")
+    assert Settings(_env_file=None).neighbour_beta == 0.0
+
+
+def test_patent_ef_search_is_at_most_pgvector_maximum(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("PATENT_HNSW_EF_SEARCH", "1001")  # pgvector hnsw.ef_search maximum is 1000
+    with pytest.raises(ValidationError, match="patent_hnsw_ef_search"):
+        Settings(_env_file=None)
+    clean_env.setenv("PATENT_HNSW_EF_SEARCH", "1000")
+    assert Settings(_env_file=None).patent_hnsw_ef_search == 1000
+
+
 def test_ef_search_must_cover_k(clean_env: pytest.MonkeyPatch) -> None:
     clean_env.setenv("NEIGHBOUR_K", "300")
     with pytest.raises(ValidationError, match="PATENT_HNSW_EF_SEARCH"):
@@ -148,17 +168,23 @@ class _Result:
 
 
 class _FakeConn:
-    """Answers the corpus SELECT with a fixed row and records every statement."""
+    """Answers the corpus SELECT with a fixed row and records every statement and cursor use."""
 
-    def __init__(self, state: str) -> None:
+    def __init__(self, state: str, *, autocommit: bool = False) -> None:
         now = date(2026, 10, 13)
         self.row = ("c1", "hupd", None, "compact", None, None, 0, "m", "r", None, state, False, now, now, None)
+        self.autocommit = autocommit
         self.statements: list[str] = []
+        self.cursors_opened = 0
         self.commits = self.rollbacks = 0
 
     def execute(self, query: str, params: object = None) -> _Result:
         self.statements.append(query)
         return _Result(self.row if query.lstrip().startswith("SELECT") else None)
+
+    def cursor(self) -> object:  # every COPY / staging statement goes through a cursor
+        self.cursors_opened += 1
+        raise AssertionError("no cursor (staging table, COPY or INSERT) may be opened")
 
     def commit(self) -> None:
         self.commits += 1
@@ -182,6 +208,47 @@ def test_set_serving_accepts_validated_corpus() -> None:
     updates = [s for s in conn.statements if s.lstrip().startswith("UPDATE")]
     assert len(updates) == 2 and "is_serving = true" in updates[1]
     assert conn.commits == 1
+
+
+def _doc_for_unit(doc_id: str) -> PatentDocument:
+    return PatentDocument(doc_id, "T", "An abstract.", None, None, ["H04L1218"], [("H04L", "H04L 12/00", "H04L 12/18")])
+
+
+def test_writes_to_a_validated_corpus_are_refused_before_any_copy() -> None:
+    conn = _FakeConn("validated")
+    with pytest.raises(CorpusStateError, match="validated"):
+        patents.upsert_documents(conn, "c1", [_doc_for_unit("d1")])  # type: ignore[arg-type]
+    with pytest.raises(CorpusStateError, match="validated"):
+        patents.insert_embeddings(conn, "c1", [("d1", np.ones(1024, dtype=np.float32))])  # type: ignore[arg-type]
+    assert conn.cursors_opened == 0  # no staging table, COPY or INSERT
+    assert all(s.lstrip().startswith("SELECT") for s in conn.statements)
+    assert conn.commits == 0 and conn.rollbacks >= 2
+
+
+def test_batched_writes_refuse_autocommit_connections() -> None:
+    conn = _FakeConn("loading", autocommit=True)
+    with pytest.raises(patents.PatentCorpusError, match="autocommit"):
+        patents.upsert_documents(conn, "c1", [_doc_for_unit("d1")])  # type: ignore[arg-type]
+    with pytest.raises(patents.PatentCorpusError, match="autocommit"):
+        patents.insert_embeddings(conn, "c1", [("d1", np.ones(1024, dtype=np.float32))])  # type: ignore[arg-type]
+    assert conn.statements == [] and conn.cursors_opened == 0
+
+
+def test_a_failing_batch_is_rolled_back_and_re_raised() -> None:
+    conn = _FakeConn("loading")  # writable, so the batch reaches the cursor, which fails
+    with pytest.raises(AssertionError, match="no cursor"):
+        patents.upsert_documents(conn, "c1", [_doc_for_unit("d1")])  # type: ignore[arg-type]
+    assert conn.rollbacks == 1 and conn.commits == 0
+
+
+def test_invalid_rows_fail_before_the_corpus_row_is_locked() -> None:
+    conn = _FakeConn("loading")
+    with pytest.raises(ValueError, match="768 dimensions"):
+        patents.insert_embeddings(conn, "c1", [("d1", np.ones(768))])  # type: ignore[arg-type]
+    bad = PatentDocument("d1", "T", "An abstract.", None, None, [], [("H04L", None)])  # type: ignore[list-item]
+    with pytest.raises(ValueError, match="resolved label"):
+        patents.upsert_documents(conn, "c1", [bad])  # type: ignore[arg-type]
+    assert conn.statements == []  # no SELECT ... FOR SHARE was issued
 
 
 def test_batches_and_vector_checks() -> None:
@@ -212,13 +279,27 @@ def db_conn():
     from app.db.session import connect_direct
 
     conn = connect_direct()
-    created: list[str] = []
-    yield conn, created
-    conn.rollback()
-    conn.execute("UPDATE patent_corpora SET is_serving = false WHERE corpus_id = ANY(%s)", [created])
-    conn.execute("DELETE FROM patent_corpora WHERE corpus_id = ANY(%s)", [created])
+    row = conn.execute("SELECT corpus_id FROM patent_corpora WHERE is_serving").fetchone()
+    previous_serving = row[0] if row else None
     conn.commit()
-    conn.close()
+    created: list[str] = []
+    try:
+        yield conn, created
+    finally:
+        # Runs even if the test fails midway: remove test corpora, then give serving back to whichever
+        # corpus served before the test, so a failure cannot leave nothing serving.
+        conn.rollback()
+        conn.execute("UPDATE patent_corpora SET is_serving = false WHERE corpus_id = ANY(%s)", [created])
+        conn.execute("DELETE FROM patent_corpora WHERE corpus_id = ANY(%s)", [created])
+        if previous_serving is not None:
+            conn.execute(
+                "UPDATE patent_corpora SET is_serving = true, updated_at = now()"
+                " WHERE corpus_id = %s AND NOT is_serving"
+                " AND NOT EXISTS (SELECT 1 FROM patent_corpora WHERE is_serving)",
+                [previous_serving],
+            )
+        conn.commit()
+        conn.close()
 
 
 def _spec(created: list[str], **overrides: object) -> CorpusSpec:
@@ -260,8 +341,7 @@ def test_serving_an_unvalidated_corpus_is_refused(db_conn) -> None:
 
 @pytest.mark.integration
 def test_corpus_round_trip_and_single_serving(db_conn) -> None:
-    conn, created = db_conn
-    previous = patents.get_serving_corpus(conn)
+    conn, created = db_conn  # the fixture restores the previously serving corpus on teardown
     spec = _spec(created)
     corpus = patents.create_or_get_corpus(conn, spec)
     assert patents.create_or_get_corpus(conn, spec).created_at == corpus.created_at  # get, not a second row
@@ -299,5 +379,3 @@ def test_corpus_round_trip_and_single_serving(db_conn) -> None:
     assert serving == [(other.corpus_id,)]  # at most one serving corpus
 
     assert patents.unset_serving_corpus(conn) == other.corpus_id
-    if previous is not None:
-        patents.set_serving_corpus(conn, previous.corpus_id)
