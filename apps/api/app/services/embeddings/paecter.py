@@ -11,8 +11,9 @@ Kept apart from ``providers.py`` on purpose: the main pipeline keys its single p
 
 The model loads from a local directory (the Hugging Face downloader stalled on this network; a copy
 fetched at the pinned commit lives at ``D:/ipc_knn/models/paecter``) or from the hub by id + revision.
-A plain local directory does not record its revision, so the caller states it; when the weights'
-SHA-256 for that revision is known it is verified, and a Hugging Face cache snapshot path
+A plain local directory does not record its revision, so the caller states it and the weights' SHA-256 is
+checked against ``KNOWN_WEIGHTS_SHA256[revision]``. A revision with no known hash is refused unless the
+caller passes ``verify_weights=False`` explicitly (logged as a warning). A Hugging Face cache snapshot path
 (``.../snapshots/<commit>``) must name the stated revision.
 """
 
@@ -108,14 +109,22 @@ def check_local_copy(path: Path, revision: str, *, verify_weights: bool = True) 
         raise PaecterError(f"{path} is not a SentenceTransformer directory (no modules.json)")
     if path.parent.name == "snapshots" and path.name != revision:
         raise EncoderMismatch(f"{path} is the Hugging Face snapshot of revision {path.name}, not {revision}")
+    if not verify_weights:
+        log.warning("PaECTER local copy %s: weights NOT verified for revision %s (verify_weights=False)", path,
+                    revision)  # fmt: skip
+        return
     want = KNOWN_WEIGHTS_SHA256.get(revision)
-    if verify_weights and want is not None:
-        weights = path / "model.safetensors"
-        if not weights.is_file():
-            raise PaecterError(f"{weights} not found")
-        got = sha256_file(weights)
-        if got != want:
-            raise EncoderMismatch(f"{weights} has SHA-256 {got}, expected {want} for revision {revision}")
+    if want is None:
+        raise EncoderMismatch(
+            f"no known weights SHA-256 for revision {revision}, so {path} cannot be checked against it; add the "
+            "hash to KNOWN_WEIGHTS_SHA256 or pass verify_weights=False explicitly"
+        )
+    weights = path / "model.safetensors"
+    if not weights.is_file():
+        raise PaecterError(f"{weights} not found")
+    got = sha256_file(weights)
+    if got != want:
+        raise EncoderMismatch(f"{weights} has SHA-256 {got}, expected {want} for revision {revision}")
 
 
 def _is_oom(exc: BaseException) -> bool:

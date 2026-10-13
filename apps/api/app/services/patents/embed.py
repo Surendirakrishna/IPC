@@ -108,6 +108,9 @@ class EmbedReport:
     skipped_existing: int = 0
     skipped_unknown_id: int = 0
     skipped_text_mismatch: int = 0
+    # False only for an import whose id list carried no texts: its vectors were stored without checking that
+    # the stored documents still have the text they were computed from.
+    text_checked: bool = True
     state: str | None = None
     input_hash: str | None = None
     batches: list[int] = field(default_factory=list)
@@ -333,7 +336,11 @@ def import_precomputed(
     if len(set(source.ids)) != len(source.ids):
         raise PatentEmbedError("the id list has duplicate ids")
 
-    report = EmbedReport(corpus_id)
+    report = EmbedReport(corpus_id, text_checked=source.text_digests is not None)
+    if not report.text_checked:
+        log.warning("corpus %s: importing precomputed vectors WITHOUT a text check (the id list has no titles or "
+                    "abstracts); a document whose text changed since the vectors were computed keeps a stale "
+                    "vector. Pass a JSONL id list with title/abstract to check.", corpus_id)  # fmt: skip
     report.documents, report.embedded_before = store.counts(corpus_id)
     done = store.embedded_ids(corpus_id)
     offsets = np.cumsum([0] + [a.shape[0] for a in arrays])
