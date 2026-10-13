@@ -1,9 +1,20 @@
 # Benchmark: IP India published applications
 
-**Summary.** On 123 held-out real Indian patent applications (title + abstract only), the current
-pipeline (WIPO 2026.01 hierarchy, subclass-first retrieval, reranker without WIPO notes, policy v2 with
-WIPO precedence rules; scored 2026-10-12) answers 97.6% of the time. Its first code matches a recorded
-IPC symbol at:
+**Summary, neighbour vote (served, 2026-10-14).** With the neighbour vote on
+(`NEIGHBOUR_VOTE_ENABLED=true`, corpus `hupd-2017`), the first code on the same 123 held-out
+applications matches a recorded IPC symbol at:
+- **subclass:** 63.4% (95% CI 54.6–71.4);
+- **main group:** 44.7% (36.2–53.5);
+- **exact symbol:** 30.1% (22.7–38.7).
+
+It never abstains, its field of invention matches the office's label 56.1% of the time, and the
+median request takes 1.6 s. That is about twice the definition-matching figures below, with
+non-overlapping intervals at every level. Details: [Neighbour vote, served](#neighbour-vote-served-live-held-out-test-2026-10-14).
+
+**Summary, definition matching (the vote off, which is the default).** On the same 123 held-out
+applications (title + abstract only), definition matching (WIPO 2026.01 hierarchy, subclass-first
+retrieval, reranker without WIPO notes, policy v2 with WIPO precedence rules; scored 2026-10-12)
+answers 97.6% of the time. Its first code matches a recorded IPC symbol at:
 - **subclass:** 30.9% (95% CI 23.4–39.5);
 - **main group:** 17.9% (12.1–25.6);
 - **exact symbol:** 8.9% (5.1–15.3).
@@ -130,8 +141,9 @@ or a fresh test sample. This test set should not be re-run with other weights.
 
 ### Nearest-neighbour vote over labelled patents (offline experiment, 2026-10-13)
 
-A different method, not a change to the API. It does not match the abstract against IPC definition
-text. Instead, it finds the most similar **already-classified patents** and lets their IPC codes vote.
+A different method from definition matching, first tested offline; it is now served by the API
+(next section). It does not match the abstract against IPC definition text. Instead, it finds the
+most similar **already-classified patents** and lets their IPC codes vote.
 
 - **Corpus:** 293,711 USPTO applications filed in 2017 (HUPD, `HUPD/hupd` on Hugging Face), each with
   title, abstract and USPTO-assigned IPC codes (3.8 on average).
@@ -187,6 +199,59 @@ Caveats:
 
 Code and outputs: `data/manifests/benchmarks/knn_hupd/` (`report.json`, `results_test_*.jsonl`).
 Corpus and vectors live outside the repo in `D:/ipc_knn/`.
+
+### Neighbour vote, served (live held-out test, 2026-10-14)
+
+The offline experiment above, served by the API. Configuration, fixed before the test run:
+- Corpus `hupd-2017` on sakthi: 293,685 HUPD 2017 applications, PaECTER vectors as `halfvec(1024)`,
+  partial HNSW index m=32 / ef_construction=200, recall@100 0.9884 against exact search
+  (`data/manifests/patents/`).
+- Vote: k=100, T=0.005, β=1 (the offline dev choice), `hnsw.ef_search` 200, minimum first-code
+  subclass share 0.2 (provisional, untuned).
+- API on 127.0.0.1:8100 with `NEIGHBOUR_VOTE_ENABLED=true`, `EMBEDDING_DEVICE=cuda` and the local
+  PaECTER copy. Abstract-only requests, `max_results` 5.
+- Dev first: subclass top-1 had to be within 3 points of the offline dev figure (73.1%) before the
+  test set was run. It was 71.5%. The test set was then run **once**, with nothing changed.
+
+Runs: `data/manifests/benchmarks/neighbour_v1__{dev,test}_abstract/` (`report.json`, and
+`serving.json` with the `/ready` vote state and the classifier counts). Scored with `_score_docs`.
+
+| Held-out test, 123 applications | Subclass top-1 | Main-group top-1 | Exact top-1 | Field label | Median s |
+| --- | --- | --- | --- | --- | --- |
+| Definition matching (after rebuild) | 30.9% (23.4–39.5) | 17.9% (12.1–25.6) | 8.9% (5.1–15.3) | 40.8% | 9.5 |
+| kNN vote, PaECTER, offline (exact search) | 65.9% (57.1–73.6) | 48.0% (39.3–56.7) | 31.7% (24.1–40.4) | – | – |
+| **Neighbour vote, served** | **63.4% (54.6–71.4)** | **44.7% (36.2–53.5)** | **30.1% (22.7–38.7)** | **56.1% (47.3–64.6)** | **1.6** |
+
+| Dev, 130 applications | Subclass top-1 | Main-group top-1 | Exact top-1 | Field label |
+| --- | --- | --- | --- | --- |
+| kNN vote, PaECTER, offline | 73.1% | 59.2% | 35.4% | – |
+| Neighbour vote, served | 71.5% (63.3–78.6) | 59.2% (50.6–67.3) | 32.3% (24.9–40.8) | 60.0% |
+
+- **Which classifier answered.** Test: 124 of the 125 responses came from the vote and 1 from the
+  definition fallback (`202531030525`, a vote below the 0.2 minimum). Dev: all 130 from the vote. No
+  document abstained. These counts are inferred from `retrieval_debug`, see the known gap below.
+- **Served against offline.** The served vote is 2–4 documents per level behind offline on test
+  (78 / 55 / 37 against 81 / 59 / 39 of 123), well inside the intervals. Search is not the only difference: the served corpus is 26 documents smaller
+  (no resolvable label), and its labels went through the WIPO concordance, so H01L patents now vote for
+  H10 codes, which they could not offline.
+- **Recorded symbol among the returned codes** (test): subclass 78.0% within the first 3 and within 5;
+  main group 57.7% / 60.2%; exact 40.7% / 42.3%. Only the codes the API returned count here: at most 5,
+  each with at least 0.2 vote share. That is a stricter measure than the offline hit@3 above, which
+  used the whole vote ranking.
+- **Do not compare hit@10 or hit@100.** For a vote response the benchmark's ranked list holds only the
+  returned codes (5 or fewer), so the vote's hit@10 and hit@100 in `report.json` equal its hit@5. The
+  definition path's hit@10 and hit@100 were measured over about 100 reranked candidates. Compare top-1,
+  and hit@3 / hit@5 only.
+- **QKD example (live):** H04L 9/08 "Key distribution" at 87.9% vote share, then H04L 9/14 (34.1%)
+  and H04L 9/32 (22.1%). H04B 10/70 (16.1%) is below the minimum share and is not listed.
+- **Known gap: benchmark provenance.** `ipc benchmark` still records only the definition path's
+  provenance per result and in the report's `pipeline` (embedding run, field mapping, reranker policy).
+  It does not record `classifier`, `fallback_reason`, the vote settings or the patent corpus, so the
+  `pipeline` entry in these reports describes the definition path even though the vote chose the codes.
+  The classifier counts above were inferred: a fallback response carries `reranked_candidates` in
+  `retrieval_debug`, a vote response only `vote_*` keys. `serving.json` holds the vote settings as read
+  from `/ready`. The per-document `results.jsonl` files are git-ignored (`*.jsonl`), so they exist only
+  on the machine that ran the benchmark.
 
 ### Previous pipeline: abstract-only (title + abstract)
 
@@ -385,19 +450,28 @@ Only claim handling changes. Live results, `_score_docs`:
 
 ## Next improvements, by expected value
 
-1. **Re-score the held-out test set** with the current pipeline, once, and quote that figure instead
-   of the dev numbers above.
-2. **Train a patent-specific reranker** on expert-reviewed examples, with hard negatives from nearby
+Done: the held-out test set was re-scored once for definition matching (2026-10-12) and once for the
+served neighbour vote (2026-10-14).
+
+1. **Record the classifier in benchmark output.** `ipc benchmark` should store `classifier`,
+   `fallback_reason`, the vote settings and the patent corpus per result and in the report's
+   `pipeline` (the known gap above).
+2. **Load a recent labelled corpus** (USPTO grants 2021–2025), once the USPTO reader has been checked
+   against a live response and its paging fix is in ([model-operation.md](model-operation.md#uspto-grants---source-uspto-odp)).
+   The 2017 corpus cannot vote for subclasses created since then.
+3. **Choose the minimum vote share on dev.** 0.2 is provisional. Then fit a vote-share calibrator on
+   reviewed labels.
+4. **Train a patent-specific reranker** on expert-reviewed examples, with hard negatives from nearby
    parts of the scheme. The ranking gap is large: on dev, the correct subclass is in the top 100 for
    83% of documents but ranked first for about 42%.
    - The tooling is ready: `ipc review-queue`, `review-finalize` and `mine-negatives`, described in
      [model-operation.md](model-operation.md#review-family-splits-and-reranker-training-data).
    - It needs reviewed labels; applicant-declared codes are too noisy to train on.
-3. **Build a larger expert-reviewed evaluation set**, keeping patent families together across
+5. **Build a larger expert-reviewed evaluation set**, keeping patent families together across
    splits (`ipc families`), and use it to fit the confidence calibrator. About 500 documents halves
    the width of the intervals. In the current samples, two families have two members each; both
    pairs sit within a single split.
-4. **Have a domain expert review field mapping v2**: 12 subclass overrides were learned from small
+6. **Have a domain expert review field mapping v2**: 12 subclass overrides were learned from small
    counts.
 
 ## Reproduce
@@ -416,6 +490,12 @@ uv run ipc benchmark ../../data/evaluation/ipindia_test_pool_2026-10.jsonl --mod
 uv run ipc benchmark ../../data/evaluation/ipindia_test_pool_2026-10.jsonl --mode abstract+claims
 uv run ipc benchmark-compare ../../data/evaluation/ipindia_test_pool_2026-10.jsonl \
   ../../data/manifests/benchmarks/ipindia_test_pool_2026-10__abstract/results.jsonl
+
+# neighbour vote (API on :8100 with NEIGHBOUR_VOTE_ENABLED=true): dev first, then the test set once
+uv run ipc benchmark ../../data/evaluation/ipindia_2026-09.jsonl --api-url http://127.0.0.1:8100 \
+  --out-dir ../../data/manifests/benchmarks/neighbour_v1__dev_abstract
+uv run ipc benchmark ../../data/evaluation/ipindia_test_pool_2026-10.jsonl --api-url http://127.0.0.1:8100 \
+  --out-dir ../../data/manifests/benchmarks/neighbour_v1__test_abstract
 
 # dev-only tuning (as used to choose v2)
 uv run ipc benchmark-tune ../../data/evaluation/ipindia_2026-09.jsonl \
