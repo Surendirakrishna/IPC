@@ -75,10 +75,84 @@ def test_refusal_rule() -> None:
     assert "'embedded'" in (_refusal([("uspto-2021", "embedded", False)]) or "")
 
 
+class _FakeConn:
+    def __init__(self, corpora: list[tuple[str, str, bool]] | None = None, rowcount: int = 1) -> None:
+        self.corpora, self.rowcount, self.sql, self.autocommit = corpora or [], rowcount, [], True
+
+    def execute(self, query: str, params: Any = None) -> Any:
+        from types import SimpleNamespace
+
+        self.sql.append((str(query), params))
+        return SimpleNamespace(rowcount=self.rowcount, fetchall=lambda: self.corpora)
+
+    def commit(self) -> None: ...
+    def rollback(self) -> None: ...
+
+
+def test_unserve_is_scoped_to_the_it_test_corpus_and_checks_the_rowcount() -> None:
+    conn = _FakeConn()
+    _unserve(conn, "it-test-x")
+    query, params = conn.sql[0]
+    assert "corpus_id = %s AND corpus_id LIKE %s" in query and params == ["it-test-x", "it-test-%"]
+    with pytest.raises(AssertionError, match="was not the serving corpus"):
+        _unserve(_FakeConn(rowcount=0), "it-test-x")
+    with pytest.raises(AssertionError):
+        _unserve(conn, "hupd-2017")  # never a real corpus id
+
+
+def test_guarded_activate_refuses_when_a_real_corpus_serves() -> None:
+    with pytest.raises(AssertionError, match="refusing to run: corpus 'hupd-2017' is serving"):
+        _guarded_activate(_FakeConn([("hupd-2017", "validated", True)]), "it-test-x")
+
+
+def test_drop_index_is_concurrent_with_a_lock_timeout() -> None:
+    conn = _FakeConn()
+    _drop_index(conn, "it-test-x")
+    texts = [q for q, _ in conn.sql]
+    assert texts[0] == "SET lock_timeout = '5s'" and "DROP INDEX CONCURRENTLY IF EXISTS" in texts[1]
+    assert texts[2] == "RESET lock_timeout"
+
+
 def _counts(conn: Any) -> dict[str, int]:
     out = {t: conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in PATENT_TABLES}  # fixed names
     conn.rollback()
     return out
+
+
+def _guarded_activate(conn: Any, corpus_id: str) -> Any:
+    """Activate an it-test corpus, after re-checking that no real corpus is serving, loading or embedded: activation
+    un-serves whatever else serves, so a real corpus activated since the fixture's check must not be displaced."""
+    from app.services.patents import index as ix
+
+    reason = _refusal(conn.execute("SELECT corpus_id, state, is_serving FROM patent_corpora").fetchall())
+    conn.rollback()
+    assert reason is None, reason
+    assert corpus_id.startswith(TEST_PREFIX)
+    return ix.activate_corpus(conn, corpus_id)
+
+
+def _unserve(conn: Any, corpus_id: str) -> None:
+    """Stop serving this it-test corpus only (never whatever happens to be serving)."""
+    assert corpus_id.startswith(TEST_PREFIX)
+    cur = conn.execute("UPDATE patent_corpora SET is_serving = false, updated_at = now()"
+                       " WHERE corpus_id = %s AND corpus_id LIKE %s AND is_serving", [corpus_id, TEST_PREFIX + "%"])
+    assert cur.rowcount == 1, f"{corpus_id} was not the serving corpus (rowcount {cur.rowcount})"
+    conn.commit()
+
+
+def _drop_index(conn: Any, corpus_id: str) -> None:
+    """DROP INDEX CONCURRENTLY (no ACCESS EXCLUSIVE lock on the shared patent_embeddings table), waiting at most
+    5 s for its lock, as ``retire_corpus`` does. The connection must be in autocommit mode."""
+    from psycopg import sql
+
+    from app.services.patents import index as ix
+
+    assert conn.autocommit
+    conn.execute("SET lock_timeout = '5s'")
+    try:
+        conn.execute(sql.SQL("DROP INDEX CONCURRENTLY IF EXISTS {}").format(sql.Identifier(ix.index_name(corpus_id))))
+    finally:
+        conn.execute("RESET lock_timeout")
 
 
 def _unit(rng: np.random.Generator) -> np.ndarray:
@@ -108,7 +182,7 @@ class FixedPatentEncoder:
 
 @pytest.fixture
 def db():
-    """(conn, created_corpora, created_indexes) on the opted-in target; teardown removes only it-test-* rows."""
+    """(conn, created_corpora) on the opted-in target; teardown removes only it-test-* rows."""
     target = _integration_target()
     if target is None:
         pytest.skip("set IPC_DB_TARGET=local (or IPC_DB_TARGET=sakthi with IPC_INTEGRATION_ALLOW_SAKTHI=1)")
@@ -128,15 +202,13 @@ def db():
     try:
         yield conn, created
     finally:
-        from psycopg import sql
 
-        from app.services.patents import index as ix
 
         assert all(c.startswith(TEST_PREFIX) for c in created), created
         conn.rollback()
         conn.autocommit = True
         for cid in created:
-            conn.execute(sql.SQL("DROP INDEX IF EXISTS {}").format(sql.Identifier(ix.index_name(cid))))
+            _drop_index(conn, cid)
         conn.execute("UPDATE patent_corpora SET is_serving = false WHERE corpus_id = ANY(%s) AND corpus_id LIKE %s",
                      [created, TEST_PREFIX + "%"])
         conn.execute("DELETE FROM patent_corpora WHERE corpus_id = ANY(%s) AND corpus_id LIKE %s",
@@ -189,7 +261,7 @@ def _build_serving_corpus(conn: Any, created: list[str], rng: np.random.Generato
     validated = ix.validate_corpus(conn, corpus_id, probes=20, k=K, threshold=0.95)
     conn.commit()
     assert validated["passed"] is True, validated
-    activated = ix.activate_corpus(conn, corpus_id)
+    activated = _guarded_activate(conn, corpus_id)
     assert activated.is_serving and activated.state == "validated"
     query = _near(centre_a, rng, 0.05)  # nearest by far: the 150 H04L patents
     return corpus_id, query, validated
@@ -270,9 +342,8 @@ def test_classify_uses_the_neighbour_vote_then_falls_back_when_the_corpus_stops_
     assert all(0 < n.vote_weight <= 1 for n in nb)
 
     # --- remove the serving corpus: the same request takes the fallback ---------------------------------------
-    from app.db import patents
 
-    assert patents.unset_serving_corpus(conn) == corpus_id
+    _unserve(conn, corpus_id)
     r = client.post("/v1/classify", json=body)
     assert r.status_code == 200, r.text
     fb = ClassifyResponse.model_validate(r.json())
@@ -284,18 +355,16 @@ def test_classify_uses_the_neighbour_vote_then_falls_back_when_the_corpus_stops_
     assert any("No validated patent corpus is serving" in w for w in fb.warnings)
 
     # --- serving again restores the vote (activation needs no restart) -------------------------------------
-    from app.services.patents import index as ix
 
-    ix.activate_corpus(conn, corpus_id)
+    _guarded_activate(conn, corpus_id)
     again = ClassifyResponse.model_validate(client.post("/v1/classify", json=body).json())
     assert again.classifier == "neighbour_vote" and again.vote is not None and again.vote.first_code == "H04L 9/08"
-    patents.unset_serving_corpus(conn)
+    _unserve(conn, corpus_id)
 
     # --- cleanup is verified by the fixture; record that the tables return to their starting counts ----------
-    from psycopg import sql
 
     conn.autocommit = True
-    conn.execute(sql.SQL("DROP INDEX IF EXISTS {}").format(sql.Identifier(ix.index_name(corpus_id))))
+    _drop_index(conn, corpus_id)
     conn.execute("DELETE FROM patent_corpora WHERE corpus_id = %s AND corpus_id LIKE %s", [corpus_id, TEST_PREFIX + "%"])
     conn.autocommit = False
     after = _counts(conn)
