@@ -28,7 +28,7 @@ from __future__ import annotations
 import random
 import re
 import time
-from collections.abc import Container, Iterable, Iterator, Mapping
+from collections.abc import Container, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -50,6 +50,15 @@ class IngestError(RuntimeError):
     pass
 
 
+class HoldoutLeak(IngestError):
+    """Hold-out ids are in the corpus after the write (an earlier run with another seed or hold-out, or duplicate
+    ids in the source). ``manifest`` is the full ingestion manifest, with ``holdout_leak`` listing them."""
+
+    def __init__(self, message: str, manifest: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.manifest = manifest
+
+
 class IngestRepository(Protocol):
     """Corpus storage used by ``ingest``. ``DbIngestRepository`` is the database implementation."""
 
@@ -60,6 +69,8 @@ class IngestRepository(Protocol):
     def upsert_documents(self, corpus_id: str, documents: Iterable[PatentDocument], batch_size: int) -> int: ...
 
     def document_count(self, corpus_id: str) -> int: ...
+
+    def existing_ids(self, corpus_id: str, document_ids: Sequence[str]) -> set[str]: ...
 
 
 class DbIngestRepository:
@@ -83,6 +94,16 @@ class DbIngestRepository:
         n = self.conn.execute("SELECT count(*) FROM patent_documents WHERE corpus_id = %s", [corpus_id]).fetchone()[0]
         self.conn.rollback()
         return int(n)
+
+    def existing_ids(self, corpus_id: str, document_ids: Sequence[str]) -> set[str]:
+        if not document_ids:
+            return set()
+        rows = self.conn.execute(
+            "SELECT document_id FROM patent_documents WHERE corpus_id = %s AND document_id = ANY(%s)",
+            [corpus_id, list(document_ids)],
+        ).fetchall()
+        self.conn.rollback()
+        return {r[0] for r in rows}
 
 
 def has_usable_label(record: PatentRecord) -> bool:
@@ -116,6 +137,7 @@ class _Counts:
     held_out: int = 0
     not_sampled: int = 0
     selected: int = 0
+    holdout_duplicate: int = 0  # selected, but its id is also a hold-out id (duplicate ids in the source): skipped
     unresolvable: int = 0
     stored: int = 0
 
@@ -156,6 +178,7 @@ def ingest(
     labels_taxonomy_version: str | None = None,
     source_parameters: Mapping[str, Any] | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    allow_holdout_leak: bool = False,
 ) -> dict[str, Any]:
     """Write ``source_records`` into the corpus and return the ingestion manifest.
 
@@ -167,10 +190,21 @@ def ingest(
     Without ``sample_size`` and ``holdout_size`` every eligible record is loaded, in source order. The corpus
     is set to ``loading`` before writing (a serving corpus is refused by the state machine) and stays
     ``loading`` with its document count recorded: ready for embedding.
+
+    The hold-out and the corpus are disjoint by position; to keep them disjoint by id, a selected record whose
+    id is also a hold-out id is skipped (``holdout_duplicate``), and after writing the corpus is checked for every
+    hold-out id. Any found (e.g. left by an earlier run with another seed) raise ``HoldoutLeak`` (listed in
+    ``manifest["holdout_leak"]``) unless ``allow_holdout_leak``.
+
+    A ``concordance`` must have been loaded with a catalogue (``load_concordance(path, catalogue)``): without one
+    its ``resolve`` cannot tell which targets exist.
     """
     t0 = time.perf_counter()
     if batch_size < 1:
         raise ValueError("batch_size must be >= 1")
+    if concordance is not None and getattr(concordance, "catalogue", None) is None:
+        raise IngestError("the concordance has no catalogue; load it with load_concordance(path, catalogue) for the "
+                          "same taxonomy release as the labels")
     repo: IngestRepository = DbIngestRepository(repository) if isinstance(repository, Connection) else repository
     sampling = sample_size is not None or holdout_size > 0
     counts = _Counts()
@@ -260,7 +294,12 @@ def ingest(
         for record in records:
             yield from _document(record)
 
+    holdout_set = set(holdout_ids)
+
     def _document(record: PatentRecord) -> Iterator[PatentDocument]:
+        if record.document_id in holdout_set:
+            counts.holdout_duplicate += 1
+            return
         resolution = resolve_labels(record.raw_labels, record.label_scheme, catalogue, concordance)
         stats.add(resolution.stats)
         if not resolution.labels:
@@ -301,4 +340,10 @@ def ingest(
     if document_count != counts.stored:
         manifest["note"] = (f"the corpus holds {document_count} documents, this run wrote {counts.stored}: documents "
                             "from earlier runs with other parameters (or duplicate ids in the source) are counted too")
+    leaked = sorted(repo.existing_ids(spec.corpus_id, holdout_ids)) if holdout_ids else []
+    manifest["holdout_leak"] = leaked
+    if leaked and not allow_holdout_leak:
+        raise HoldoutLeak(f"{len(leaked)} hold-out id(s) are in corpus {spec.corpus_id!r} (e.g. {leaked[:5]}): the "
+                          "hold-out would not be held out; delete those documents or load into a fresh corpus",
+                          manifest)  # fmt: skip
     return manifest

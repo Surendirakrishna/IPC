@@ -256,7 +256,7 @@ def test_concordance_none_leaves_a_missing_label_missing() -> None:
 
 
 def test_concordance_reads_structured_labels_as_printed_symbols() -> None:
-    conc = FakeConcordance({"H01L 21/027": ResolvedLabel("H10P", "H10P 76/00", None)})
+    conc = FakeConcordance({"H01L 21/027": ResolvedLabel("H10B", "H10B 10/00", None)})
     raw = [
         {"section": "H", "class": "01", "subclass": "L", "main_group": "0021", "subgroup": "0270"},
         ("H", "01", "L", "23", None),  # main group only
@@ -265,7 +265,7 @@ def test_concordance_reads_structured_labels_as_printed_symbols() -> None:
     ]
     res = resolve_labels(raw, "structured", CATALOGUE, concordance=conc)
     assert conc.asked == ["H01L 21/027", "H01L 23/00", "H01L"]
-    assert res.labels == [ResolvedLabel("H10P", "H10P 76/00", None), ResolvedLabel("H04L", "H04L 12/00", "H04L 12/18")]
+    assert res.labels == [ResolvedLabel("H10B", "H10B 10/00", None), ResolvedLabel("H04L", "H04L 12/00", "H04L 12/18")]
     assert res.stats.concordance == 1 and res.stats.missing == 2 and res.stats.exact == 1
 
 
@@ -274,6 +274,27 @@ def test_concordance_result_is_deduplicated_with_other_labels() -> None:
     res = resolve_labels(["H10B1000", "H01L2100"], "compact", CATALOGUE, concordance=conc)
     assert res.labels == [ResolvedLabel("H10B", "H10B 10/00", "H10B 10/00")]
     assert res.stats.exact == 1 and res.stats.concordance == 1
+
+
+@pytest.mark.parametrize(
+    ("mapped", "outcome", "label"),
+    [
+        # a concordance loaded for another release names codes this catalogue lacks: keep only what exists
+        (ResolvedLabel("H10B", "H10B 99/00", "H10B 99/12"), Outcome.CONCORDANCE, ResolvedLabel("H10B", None, None)),
+        (ResolvedLabel("H10B", "H10B 10/00", "H10B 10/99"), Outcome.CONCORDANCE,
+         ResolvedLabel("H10B", "H10B 10/00", None)),
+        # an exact code is never kept under a missing main group
+        (ResolvedLabel("H04L", "H04L 77/00", "H04L 9/08"), Outcome.CONCORDANCE, ResolvedLabel("H04L", None, None)),
+        # the mapped subclass itself is absent: the label is missing (and dropped)
+        (ResolvedLabel("H10W", "H10W 76/00", "H10W 76/12"), Outcome.MISSING, None),
+    ],
+)
+def test_concordance_labels_are_limited_to_the_callers_catalogue(mapped, outcome, label) -> None:
+    for raw in ("H01L2304", "H04L2906"):  # MISSING and SUBCLASS_ONLY outcomes before the concordance
+        res = resolve_labels([raw], "compact", CATALOGUE, concordance=FakeConcordance({raw: mapped}))
+        assert res.labels == ([label] if label else [])
+        assert getattr(res.stats, outcome.value) == 1 and res.stats.total == 1
+        assert all(code in CATALOGUE for lab in res.labels for code in lab if code is not None)
 
 
 def test_catalogue_is_any_container() -> None:
