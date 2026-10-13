@@ -137,6 +137,21 @@ def test_weights_follow_temperature_and_unlabelled_neighbours_dilute_shares() ->
     assert result.first_code_share == LevelShares(*(pytest.approx(1.0 / sum(w)),) * 3)
 
 
+def test_shares_never_exceed_one() -> None:
+    # Review finding: with sum() (compensated on Python 3.12+) as the total and naive += per code, 866 of 2000
+    # unanimous votes gave a share of 1.0000000000000018. The contract's shares are le=1.
+    rng = random.Random(20261013)
+    for _ in range(2000):
+        sims = sorted((rng.uniform(0.90, 0.99) for _ in range(100)), reverse=True)
+        beta = rng.choice([0.0, 0.5, 1.0])
+        neighbours = [N(f"d{i}", s, (H04L_908, G06F_1600) if rng.random() < 0.5 else (H04L_908,))
+                      for i, s in enumerate(sims)]  # fmt: skip
+        result = vote(neighbours, 100, 0.005, beta)
+        for level in LEVELS:
+            assert all(c.share <= 1.0 for c in result.ranked[level]), level
+        assert result.first_code_share == LevelShares(1.0, 1.0, 1.0)  # H04L 9/08 is unanimous: exactly 1
+
+
 def test_a_neighbour_counts_once_per_code_with_its_best_label_weight() -> None:
     # Two labels in H04L: the subclass counts once, at the main label's weight 1, not 1 + beta.
     result = vote([N("a", 0.9, (H04L_908, H04L_1218)), N("b", 0.9, (G06F_1600,))], 10, 0.005, 0.5)
@@ -318,6 +333,34 @@ def _integration_target() -> str | None:
     return None
 
 
+BUSY_STATES = ("loading", "embedded")
+
+
+def _refusal(corpora: list[tuple[str, str, bool]]) -> str | None:
+    """Why the integration tests must not run against this database, or None.
+
+    They create/drop an index and ANALYZE the shared patent_embeddings table, which would block or disturb a
+    live load. So they refuse when any real (non-it-test) corpus is serving, or is loading or embedding.
+    """
+    for corpus_id, state, is_serving in corpora:
+        if corpus_id.startswith(TEST_PREFIX):
+            continue
+        if is_serving:
+            return f"refusing to run: corpus {corpus_id!r} is serving"
+        if state in BUSY_STATES:
+            return f"refusing to run: corpus {corpus_id!r} is {state!r} (a load may be running)"
+    return None
+
+
+def test_integration_refuses_when_a_real_corpus_is_serving_or_loading() -> None:
+    assert _refusal([]) is None
+    assert _refusal([("it-test-a", "loading", False), ("it-test-b", "validated", True)]) is None
+    assert _refusal([("hupd-2017", "validated", False), ("old", "failed", False)]) is None
+    assert "serving" in _refusal([("hupd-2017", "validated", True)])  # type: ignore[operator]
+    assert "'loading'" in _refusal([("uspto-2021", "loading", False)])  # type: ignore[operator]
+    assert "'embedded'" in _refusal([("uspto-2021", "embedded", False)])  # type: ignore[operator]
+
+
 @pytest.fixture
 def db_conn():
     """(conn, created_corpora, created_indexes). Teardown deletes only it-test-* corpora and it_test_* indexes."""
@@ -332,11 +375,12 @@ def db_conn():
     from app.db.session import connect_direct
 
     conn = connect_direct()
-    row = conn.execute("SELECT corpus_id FROM patent_corpora WHERE is_serving").fetchone()
+    rows = conn.execute("SELECT corpus_id, state, is_serving FROM patent_corpora").fetchall()
     conn.commit()
-    if row is not None and not row[0].startswith(TEST_PREFIX):
+    reason = _refusal(rows)
+    if reason is not None:
         conn.close()
-        pytest.fail(f"refusing to run: corpus {row[0]!r} is serving")
+        pytest.fail(reason)
     created: list[str] = []
     indexes: list[str] = []
     try:

@@ -148,7 +148,13 @@ def vote(neighbours: Sequence[NeighbourLike], k: int, temperature: float, beta: 
         raise ValueError("neighbour similarities must be finite")
     s1 = sims[0]
     weights = [math.exp((s - s1) / temperature) for s in sims]
-    total = sum(weights)
+    # Accumulate naively, in the same order as the per-code scores below. Python 3.12's sum() of floats is
+    # compensated, so a code carried by every neighbour could score 1 ulp above sum() and get a share > 1.
+    # With the same naive order, a unanimous code equals total exactly, and since float addition is monotone,
+    # any subset of the (positive) weights sums to at most total: every share is <= 1.
+    total = 0.0
+    for w in weights:
+        total += w
 
     score: dict[Level, dict[str, float]] = {lvl: {} for lvl in LEVELS}
     labels_of: list[tuple[tuple[str, str | None, str | None], ...]] = []
