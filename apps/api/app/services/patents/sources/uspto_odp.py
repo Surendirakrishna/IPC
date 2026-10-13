@@ -6,13 +6,16 @@ IPC at issue as ``structured`` labels (main symbol first). Endpoint, query and f
 
 Behaviour:
 - No key: ``MissingApiKey`` naming ``USPTO_ODP_API_KEY`` before any request.
-- Rate limits: HTTP 429 waits for ``Retry-After`` (seconds or an HTTP date), else exponential backoff.
+- Rate limits: HTTP 429 waits for ``Retry-After`` (seconds or an HTTP date, capped at ``max_retry_after_s``;
+  a negative or non-finite value counts as absent), else exponential backoff.
   Server errors (5xx) and transport errors (timeouts, resets) back off exponentially. A rejected key
   (401/403) fails at once.
 - Resumable: ``cursor`` (an ``OdpCursor``, serialisable with ``to_token``) always points just past the last
   record handed out (yielded or skipped), so a new reader started from it continues without gaps or
   repeats. ``pages()`` yields each page's records together with the cursor to persist after storing them.
 - ``limit`` caps the records yielded, across years and across resumes (the cursor carries the count).
+- A year ends on an empty page, or once the records handed out for it reach the response's ``total_hits``.
+  A short page alone does not end it: the server may cap the page size below the one requested.
 
 The key is sent only in the request header and is never logged or put in an error message; abstract text
 is never logged.
@@ -24,6 +27,7 @@ import base64
 import email.utils
 import json
 import logging
+import math
 import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import asdict, dataclass, replace
@@ -78,6 +82,7 @@ class OdpCursor:
     after: str | None = None
     yielded: int = 0
     done: bool = False
+    year_read: int = 0  # records handed out (yielded or skipped) in ``year`` so far
 
     def to_token(self) -> str:
         return base64.urlsafe_b64encode(json.dumps(asdict(self), separators=(",", ":")).encode()).decode()
@@ -87,7 +92,7 @@ class OdpCursor:
         try:
             data = json.loads(base64.urlsafe_b64decode(token.encode()).decode())
             return cls(year=int(data["year"]), after=data.get("after"), yielded=int(data.get("yielded", 0)),
-                       done=bool(data.get("done", False)))  # fmt: skip
+                       done=bool(data.get("done", False)), year_read=int(data.get("year_read", 0)))  # fmt: skip
         except (ValueError, KeyError, TypeError) as exc:
             raise UsptoReaderError("invalid USPTO cursor token") from exc
 
@@ -101,14 +106,19 @@ def _key(api_key: SecretStr | str | None) -> SecretStr:
 
 
 def retry_after_seconds(value: str | None, *, now: datetime | None = None) -> float | None:
-    """``Retry-After`` as seconds: a number, or an HTTP date relative to ``now``. None if absent or invalid."""
+    """``Retry-After`` as seconds: a number, or an HTTP date relative to ``now`` (a past date gives 0).
+
+    None if absent or invalid, including a negative or non-finite number ("inf", "nan", "-5").
+    """
     if not value:
         return None
     value = value.strip()
     try:
-        return max(0.0, float(value))
+        seconds = float(value)
     except ValueError:
         pass
+    else:
+        return seconds if math.isfinite(seconds) and seconds >= 0 else None
     try:
         when = email.utils.parsedate_to_datetime(value)
     except (TypeError, ValueError):
@@ -157,6 +167,7 @@ class UsptoOdpReader:
         max_retries: int = 8,
         backoff_s: float = 2.0,
         max_backoff_s: float = 120.0,
+        max_retry_after_s: float = 300.0,
         timeout_s: float = 60.0,
         min_abstract_chars: int = MIN_ABSTRACT_CHARS,
         sleep: Callable[[float], None] = time.sleep,
@@ -182,6 +193,7 @@ class UsptoOdpReader:
         self.max_retries = max_retries
         self.backoff_s = backoff_s
         self.max_backoff_s = max_backoff_s
+        self.max_retry_after_s = max_retry_after_s
         self.timeout_s = timeout_s
         self.min_abstract_chars = min_abstract_chars
         self.sleep = sleep
@@ -231,7 +243,7 @@ class UsptoOdpReader:
                     raise UsptoAuthError(f"USPTO API rejected the request (HTTP {status}); check {ENV_NAME}")
                 if status == F.RATE_LIMIT_STATUS:
                     hinted = retry_after_seconds(resp.headers.get(F.RETRY_AFTER_HEADER))
-                    wait = hinted if hinted is not None else self._backoff(attempt)
+                    wait = min(hinted, self.max_retry_after_s) if hinted is not None else self._backoff(attempt)
                     reason = "rate limited (HTTP 429)"
                 elif status >= 500:
                     wait, reason = self._backoff(attempt), f"server error (HTTP {status})"
@@ -258,6 +270,8 @@ class UsptoOdpReader:
                 rows = data.get(F.RECORDS_FIELD) or []
                 if not isinstance(rows, list):
                     raise UsptoApiError(f"USPTO API: {F.RECORDS_FIELD!r} is not a list")
+                total_hits = data.get(F.TOTAL_FIELD)
+                total_hits = total_hits if isinstance(total_hits, int) and total_hits >= 0 else None
                 out: list[PatentRecord] = []
                 complete = True
                 for raw in rows:
@@ -276,8 +290,11 @@ class UsptoOdpReader:
                         yielded += 1
                         out.append(record)
                     self.cursor = replace(self.cursor, after=str(raw.get(F.SORT_FIELD, record.document_id)),
-                                          yielded=yielded)  # fmt: skip
-                if complete and len(rows) < self.page_size:  # a short (or empty) page ends the year
+                                          yielded=yielded, year_read=self.cursor.year_read + 1)  # fmt: skip
+                # Not "a short page": the server may cap the page size below the one requested.
+                if complete and (not rows or (total_hits is not None and self.cursor.year_read >= total_hits)):
+                    log.info("USPTO year %d: %d records read (total_hits %s)", year, self.cursor.year_read,
+                             total_hits)  # fmt: skip
                     self.cursor = self._next_year()
                 yield out, self.cursor
             log.info("USPTO read %s (%d requests)", self.stats.as_dict(), self.requests)

@@ -37,7 +37,20 @@ from app.services.patents.sources.uspto_odp import (
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "patents"
 HUPD_SAMPLE = FIXTURES / "hupd_2017_sample.tar.gz"
-RESPONSES = json.loads((FIXTURES / "uspto_odp_responses.json").read_text(encoding="utf-8"))
+RESPONSES_PATH = FIXTURES / "uspto_odp_responses.json"
+_responses: dict | None = None
+
+
+def responses() -> dict:
+    """The recorded USPTO responses. Read lazily: the file is an LFS object (``*.json`` in .gitattributes), and in
+    a checkout without LFS it is a pointer file; the USPTO tests then skip instead of breaking collection."""
+    global _responses
+    if _responses is None:
+        raw = RESPONSES_PATH.read_bytes()
+        if raw.startswith(b"version https://git-lfs"):
+            pytest.skip("USPTO fixture responses are an un-fetched LFS pointer (git lfs pull)")
+        _responses = json.loads(raw.decode("utf-8"))
+    return _responses
 
 
 # --- PatentRecord ------------------------------------------------------------------------------------------
@@ -155,7 +168,7 @@ class Api:
         body = json.loads(request.content)
         year = body["q"]["_and"][0]["_gte"][F.F_DATE][:4]
         after = body["o"].get("after") or "start"
-        return httpx.Response(200, json=RESPONSES[f"{year}:{after}"])
+        return httpx.Response(200, json=responses()[f"{year}:{after}"])
 
     def client(self) -> httpx.Client:
         return httpx.Client(transport=httpx.MockTransport(self), base_url=F.BASE_URL)
@@ -187,7 +200,7 @@ def test_uspto_reader_reads_every_year_and_page() -> None:
     assert [r.document_id for r in records] == ["10912345", "10912346", "10912400", "11212001"]
     assert reader.stats.as_dict() == {"read": 5, "yielded": 4, "skipped": 1, "skipped_reasons": {"short_abstract": 1}}
     assert reader.cursor.done and reader.cursor.yielded == 4 and sleeps == []
-    assert len(api.requests) == 4  # 2021: full page + short page; 2022: full page + empty page
+    assert len(api.requests) == 3  # each year ends once its total_hits records were read: no empty-page request
 
     first = records[0]
     assert first.source == "uspto_odp" and first.label_scheme == "structured"
@@ -215,7 +228,7 @@ def test_uspto_request_shape_and_key_header() -> None:
 
 def test_uspto_structured_labels_resolve() -> None:
     catalogue = {"H04L", "H04L 9/00", "H04L 9/08", "G06F", "G06F 21/00", "G06F 21/60"}
-    record = odp_record(RESPONSES["2021:start"]["patents"][0])
+    record = odp_record(responses()["2021:start"]["patents"][0])
     resolved = resolve_labels(record.raw_labels, record.label_scheme, catalogue)
     assert [tuple(lab) for lab in resolved.labels] == [("H04L", "H04L 9/00", "H04L 9/08"),
                                                        ("G06F", "G06F 21/00", "G06F 21/60")]  # fmt: skip
@@ -237,6 +250,19 @@ def test_uspto_backs_off_on_server_and_transport_errors() -> None:
     assert sleeps == [1.5, 3.0, 5.0, 5.0]  # 1.5 * 2**n, capped
 
 
+def test_uspto_retry_after_is_capped_and_bad_values_fall_back_to_backoff() -> None:
+    api = Api(script=[httpx.Response(429, headers={"Retry-After": "inf"}),
+                      httpx.Response(429, headers={"Retry-After": "-5"}),
+                      httpx.Response(429, headers={"Retry-After": "100000"})])  # fmt: skip
+    reader, sleeps = _reader(api, years=[2021], backoff_s=1.0)
+    assert len(list(reader)) == 3
+    assert sleeps == [1.0, 2.0, 300.0]  # inf and -5 count as absent (backoff); 100000 s is capped at 300 s
+    api = Api(script=[httpx.Response(429, headers={"Retry-After": "100000"})])
+    reader, sleeps = _reader(api, years=[2021], max_retry_after_s=30.0)
+    list(reader)
+    assert sleeps == [30.0]
+
+
 def test_uspto_gives_up_after_max_retries() -> None:
     api = Api(script=[httpx.Response(503)] * 3)
     reader, sleeps = _reader(api, years=[2021], max_retries=2)
@@ -246,7 +272,7 @@ def test_uspto_gives_up_after_max_retries() -> None:
 
 
 def test_uspto_rejected_key_fails_without_retry() -> None:
-    api = Api(script=[httpx.Response(401, json=RESPONSES["unauthorized"])])
+    api = Api(script=[httpx.Response(401, json=responses()["unauthorized"])])
     reader, sleeps = _reader(api)
     with pytest.raises(UsptoAuthError, match="USPTO_ODP_API_KEY") as err:
         list(reader)
@@ -271,7 +297,7 @@ def test_uspto_limit_and_resume_from_cursor() -> None:
     first = list(reader)
     assert [r.document_id for r in first] == ["10912345", "10912346"]
     token = reader.cursor.to_token()
-    assert OdpCursor.from_token(token) == OdpCursor(year=2021, after="10912346", yielded=2)
+    assert OdpCursor.from_token(token) == OdpCursor(year=2021, after="10912346", yielded=2, year_read=2)
 
     resumed, _ = _reader(Api(), cursor=token)  # no limit: read to the end
     rest = list(resumed)
@@ -285,17 +311,50 @@ def test_uspto_limit_and_resume_from_cursor() -> None:
 def test_uspto_resume_mid_page_and_pages_api() -> None:
     reader, _ = _reader(Api(), limit=1)
     assert [r.document_id for r in reader] == ["10912345"]
-    assert reader.cursor == OdpCursor(year=2021, after="10912345", yielded=1)
+    assert reader.cursor == OdpCursor(year=2021, after="10912345", yielded=1, year_read=1)
     # A resume asks for records after 10912345; the recorded API has no such page, so serve it from the fixture.
-    page = {**RESPONSES["2021:start"], "patents": RESPONSES["2021:start"]["patents"][1:], "count": 1}
+    page = {**responses()["2021:start"], "patents": responses()["2021:start"]["patents"][1:], "count": 1}
     api = Api(script=[httpx.Response(200, json=page)])
     resumed, _ = _reader(api, cursor=reader.cursor)
     pages = list(resumed.pages())
     assert json.loads(api.requests[0].content)["o"]["after"] == "10912345"
-    # The page after 10912345 is short (1 < page_size 2), so it ends 2021 and the cursor moves to 2022.
-    assert [[r.document_id for r in recs] for recs, _ in pages] == [["10912346"], ["11212001"], []]
-    assert [(c.year, c.after, c.yielded, c.done) for _, c in pages] == [
-        (2022, None, 2, False), (2022, "11212001", 3, False), (2022, "11212001", 3, True)]
+    # The page after 10912345 is short (1 < page_size 2) but 2021 has total_hits 3 and only 2 were read, so the
+    # year goes on; it ends after 10912400 (3 read), and 2022 ends after its 2 hits.
+    assert [[r.document_id for r in recs] for recs, _ in pages] == [["10912346"], ["10912400"], ["11212001"]]
+    assert [(c.year, c.after, c.yielded, c.done, c.year_read) for _, c in pages] == [
+        (2021, "10912346", 2, False, 2), (2022, None, 3, False, 0), (2022, "11212001", 4, True, 2)]
+
+
+class OneRowApi(Api):
+    """A server that caps the page size at 1 whatever was requested."""
+
+    def __init__(self, with_total: bool = True) -> None:
+        super().__init__()
+        self.rows = [*responses()["2021:start"]["patents"], *responses()["2021:10912346"]["patents"]]
+        self.with_total = with_total
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        after = json.loads(request.content)["o"].get("after")
+        ids = [r["patent_id"] for r in self.rows]
+        start = 0 if after is None else ids.index(after) + 1
+        body = {"error": False, "count": len(self.rows[start:start + 1]), "patents": self.rows[start:start + 1]}
+        if self.with_total:
+            body["total_hits"] = len(self.rows)
+        return httpx.Response(200, json=body)
+
+
+def test_uspto_server_capping_the_page_size_does_not_end_the_year(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO)
+    api = OneRowApi()
+    reader, _ = _reader(api, years=[2021], page_size=2)
+    assert [r.document_id for r in reader] == ["10912345", "10912346", "10912400"]
+    assert len(api.requests) == 3 and reader.cursor.done  # ended by total_hits, no extra request
+    assert "USPTO year 2021: 3 records read (total_hits 3)" in caplog.text
+    # without total_hits, only an empty page ends the year
+    api = OneRowApi(with_total=False)
+    reader, _ = _reader(api, years=[2021], page_size=2)
+    assert len(list(reader)) == 3 and len(api.requests) == 4 and reader.cursor.done
 
 
 def test_uspto_cursor_validation() -> None:
@@ -314,6 +373,9 @@ def test_retry_after_parsing() -> None:
     assert retry_after_seconds("12", now=now) == 12.0
     assert retry_after_seconds("Tue, 13 Oct 2026 12:00:30 GMT", now=now) == 30.0
     assert retry_after_seconds(None) is None and retry_after_seconds("soon") is None
+    for bad in ("inf", "-inf", "nan", "-5"):
+        assert retry_after_seconds(bad) is None, bad
+    assert retry_after_seconds("Tue, 13 Oct 2026 11:00:00 GMT", now=now) == 0.0  # a past date: retry now
 
 
 def test_uspto_reader_never_logs_the_key_or_abstracts(caplog: pytest.LogCaptureFixture) -> None:
@@ -326,3 +388,15 @@ def test_uspto_reader_never_logs_the_key_or_abstracts(caplog: pytest.LogCaptureF
     for r in records:
         assert r.abstract[:30] not in caplog.text
     assert "Too short to vote" not in caplog.text
+
+
+def test_uspto_fixture_skips_cleanly_without_lfs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    module = sys.modules[__name__]
+    pointer = tmp_path / "uspto_odp_responses.json"
+    pointer.write_text("version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 1\n")
+    monkeypatch.setattr(module, "RESPONSES_PATH", pointer)
+    monkeypatch.setattr(module, "_responses", None)
+    with pytest.raises(pytest.skip.Exception, match="LFS pointer"):
+        responses()

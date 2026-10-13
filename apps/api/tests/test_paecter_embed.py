@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import logging
 import os
 import uuid
 from datetime import UTC, date, datetime
@@ -162,7 +163,7 @@ def test_encoder_refuses_a_corpus_with_another_revision() -> None:
         enc.require_compatible(_corpus(encoder_model_id="BAAI/bge-m3"))
 
 
-def test_local_copy_checks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_local_copy_checks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
     with pytest.raises(PaecterError, match="modules.json"):
         paecter.check_local_copy(tmp_path, PAECTER_REVISION)
     (tmp_path / "modules.json").write_text("[]")
@@ -172,8 +173,14 @@ def test_local_copy_checks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setitem(paecter.KNOWN_WEIGHTS_SHA256, "rev-b", "0" * 64)
     with pytest.raises(EncoderMismatch, match="SHA-256"):
         paecter.check_local_copy(tmp_path, "rev-b")
-    paecter.check_local_copy(tmp_path, "rev-b", verify_weights=False)
-    paecter.check_local_copy(tmp_path, "rev-unknown")  # no known hash: the stated revision is trusted
+    # A revision without a known hash is refused unless verification is skipped explicitly, which is logged.
+    with pytest.raises(EncoderMismatch, match="no known weights SHA-256 for revision rev-unknown"):
+        paecter.check_local_copy(tmp_path, "rev-unknown")
+    caplog.set_level(logging.WARNING, logger="app.services.embeddings.paecter")
+    assert "NOT verified" not in caplog.text
+    paecter.check_local_copy(tmp_path, "rev-unknown", verify_weights=False)
+    paecter.check_local_copy(tmp_path, "rev-b", verify_weights=False)  # also skips a known (wrong) hash
+    assert caplog.text.count("weights NOT verified") == 2 and "rev-unknown" in caplog.text
     snap = tmp_path / "snapshots" / ("a" * 40)
     snap.mkdir(parents=True)
     (snap / "modules.json").write_text("[]")
@@ -360,6 +367,7 @@ def test_import_precomputed_reuses_matching_vectors_and_skips_the_rest(tmp_path:
 
     report = import_precomputed(store, "c1", src, batch_size=4)
     assert report.imported == 8  # 9 offline rows in the corpus, minus d003 whose text changed
+    assert report.text_checked is True
     assert report.skipped_text_mismatch == 1 and report.skipped_unknown_id == 2  # d009 and x-not-in-corpus
     assert report.state == "loading"  # d003 and d100 still need vectors
     np.testing.assert_array_equal(store.vectors["d001"], _vec(patent_text(*docs["d001"])).astype(np.float16))
@@ -401,7 +409,7 @@ def test_import_checks_shapes_and_ids(tmp_path: Path) -> None:
         PrecomputedSource.from_directory(d, ids_file)
 
 
-def test_import_without_texts_and_id_list_formats(tmp_path: Path) -> None:
+def test_import_without_texts_and_id_list_formats(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     (tmp_path / "a.json").write_text('["1", 2]')
     assert read_id_list(tmp_path / "a.json") == (["1", "2"], None)
     (tmp_path / "b.txt").write_text("10\n 11 \n\n")
@@ -414,8 +422,11 @@ def test_import_without_texts_and_id_list_formats(tmp_path: Path) -> None:
     d = _write_offline(tmp_path, [(k, t, a) for k, (t, a) in docs.items()])
     (tmp_path / "ids.txt").write_text("\n".join(docs))
     store = MemoryStore(_corpus(), docs)
+    caplog.set_level(logging.WARNING, logger="app.services.patents.embed")
     report = import_precomputed(store, "c1", PrecomputedSource.from_directory(d, tmp_path / "ids.txt"))
     assert report.imported == 4 and report.state == "embedded"
+    assert report.text_checked is False and report.as_dict()["text_checked"] is False  # a plain id list: no texts
+    assert "WITHOUT a text check" in caplog.text
 
 
 def test_import_rejects_unnormalised_shards(tmp_path: Path) -> None:
@@ -487,6 +498,34 @@ def _integration_target() -> str | None:
     return None
 
 
+BUSY_STATES = ("loading", "embedded")
+
+
+def _refusal(corpora: list[tuple[str, str, bool]]) -> str | None:
+    """Why the integration tests must not run against this database, or None.
+
+    They create/drop an index and ANALYZE the shared patent_embeddings table, which would block or disturb a
+    live load. So they refuse when any real (non-it-test) corpus is serving, or is loading or embedding.
+    """
+    for corpus_id, state, is_serving in corpora:
+        if corpus_id.startswith(TEST_PREFIX):
+            continue
+        if is_serving:
+            return f"refusing to run: corpus {corpus_id!r} is serving"
+        if state in BUSY_STATES:
+            return f"refusing to run: corpus {corpus_id!r} is {state!r} (a load may be running)"
+    return None
+
+
+def test_integration_refuses_when_a_real_corpus_is_serving_or_loading() -> None:
+    assert _refusal([]) is None
+    assert _refusal([("it-test-a", "loading", False), ("it-test-b", "validated", True)]) is None
+    assert _refusal([("hupd-2017", "validated", False), ("old", "failed", False)]) is None
+    assert "serving" in _refusal([("hupd-2017", "validated", True)])  # type: ignore[operator]
+    assert "'loading'" in _refusal([("uspto-2021", "loading", False)])  # type: ignore[operator]
+    assert "'embedded'" in _refusal([("uspto-2021", "embedded", False)])  # type: ignore[operator]
+
+
 @pytest.fixture
 def db_conn():
     target = _integration_target()
@@ -500,11 +539,12 @@ def db_conn():
     from app.db.session import connect_direct
 
     conn = connect_direct()
-    row = conn.execute("SELECT corpus_id FROM patent_corpora WHERE is_serving").fetchone()
+    rows = conn.execute("SELECT corpus_id, state, is_serving FROM patent_corpora").fetchall()
     conn.commit()
-    if row is not None and not row[0].startswith(TEST_PREFIX):
+    reason = _refusal(rows)
+    if reason is not None:
         conn.close()
-        pytest.fail(f"refusing to run: corpus {row[0]!r} is serving")
+        pytest.fail(reason)
     created: list[str] = []
     try:
         yield conn, created
