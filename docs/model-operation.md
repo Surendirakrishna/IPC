@@ -7,11 +7,21 @@
 | Dense embeddings (served) | `BAAI/bge-m3` | `5617a9f61b028005a4858fdac845db406aefb181` | `SentenceTransformer(..., revision=...)`; fp16 on CUDA, fp32 on CPU |
 | Dense embeddings (comparison) | `embeddinggemma-2` via the self-hosted OpenAI-compatible endpoint | served model id + created stamp (the endpoint exposes no weight hash) | `GemmaApiProvider` (httpx) |
 | Reranker | `BAAI/bge-reranker-v2-m3` | `953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e` | `huggingface_hub.snapshot_download(revision=...)`, then `FlagReranker(local_path)`, because FlagReranker has no revision argument |
+| Patent encoder (neighbour vote) | `mpi-inno-comp/paecter` | `1f355d9e9a34dc4859e22d05ce27e970eeacfbd2` | `PaecterEncoder` ([paecter.py](../apps/api/app/services/embeddings/paecter.py)) from `PATENT_ENCODER_LOCAL_PATH`, with the weights' SHA-256 checked against the revision; else the Hugging Face snapshot at that revision, download bounded by `PATENT_ENCODER_DOWNLOAD_TIMEOUT_S` (300 s). fp16 on CUDA. Loaded **only** with `NEIGHBOUR_VOTE_ENABLED=true` |
 | Optional LLM | `gemma-4-26b` (self-hosted) | n/a | `OpenAICompatibleClient`; **off** unless `LLM_ENABLED=true` |
 
-Both revisions were checked against the Hugging Face API on 2026-10-08.
+The BGE revisions were checked against the Hugging Face API on 2026-10-08. The PaECTER revision is
+pinned in `config.py` (`PATENT_ENCODER_MODEL_REVISION`) and `paecter.py`, and every corpus records the
+encoder revision it was embedded with. The vote refuses a corpus embedded with another revision
+(`fallback_reason: patent_encoder_unavailable`).
 
+- **PaECTER input:** "title. abstract" (the abstract alone without a title), truncated at 512 tokens,
+  1,024 dimensions, L2-normalized. Corpus documents and queries use the same text, so vectors imported
+  from the offline experiment (`--from-npy`) are comparable.
 - Models load **once per API process**, in a background thread at startup. `/ready` reports progress.
+  PaECTER loads after the API is `ready`, in its own thread. Until it is loaded, and for good if it
+  fails, the vote answers `patent_encoder_unavailable` and the definition pipeline serves. A PaECTER
+  failure never makes `/ready` 503; it shows in `checks.neighbour_vote.patent_encoder_error`.
 - Models are never downloaded per request, and never run in the database, the browser or a
   serverless function.
 - Inference is serialized by a lock per model. The API bounds concurrent classify calls with
@@ -53,6 +63,180 @@ uv run ipc --target local activate-embeddings <run_id>     # requires validated 
   encoder differs from the model and revision of the serving run.
 - **GPU out of memory:** the batch size is halved, up to 4 retries.
 
+## Neighbour vote
+
+The vote is **off by default** (`NEIGHBOUR_VOTE_ENABLED=false` in `config.py`). With it off, the API
+answers with the definition pipeline alone (`classifier: definition_fallback`,
+`fallback_reason: neighbour_vote_disabled`). The selection rule is in
+[classification-policy.md](classification-policy.md#neighbour-vote-primary-classifier); the reasons
+are in ADR-0005 ("A PaECTER neighbour vote is the primary classifier").
+
+### Switching it on
+
+1. A validated patent corpus must be serving (`ipc patent-status` shows `"is_serving": true`). Today
+   that is `hupd-2017`.
+2. Add to `.env` (repository root):
+
+   ```
+   NEIGHBOUR_VOTE_ENABLED=true
+   PATENT_ENCODER_LOCAL_PATH=D:/ipc_knn/models/paecter
+   ```
+
+   Set the local path on this network: the Hugging Face downloader stalls here. The directory must be
+   PaECTER at the pinned revision; its weights hash is checked at load.
+3. Restart the API. The setting is read at startup.
+4. Check `/ready`: `checks.neighbour_vote.state` must be `serving` and `patent_encoder_state` must be
+   `ready`. The other states and their meaning are in [api.md](api.md). None of them makes `/ready`
+   return 503, because the definition pipeline can still answer, so check the state itself.
+
+To switch it off, set `NEIGHBOUR_VOTE_ENABLED=false` (or remove the line) and restart.
+
+### Settings
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `NEIGHBOUR_K` | 100 | nearest corpus patents that vote |
+| `NEIGHBOUR_TEMPERATURE` | 0.005 | neighbour weight `exp((s − s₁)/T)` |
+| `NEIGHBOUR_BETA` | 1.0 | weight of secondary labels (the main label counts 1); at most 1 |
+| `NEIGHBOUR_MIN_VOTE_SHARE` | 0.2 | below this first-code subclass share, the definition pipeline answers. **Provisional** |
+| `PATENT_HNSW_EF_SEARCH` | 200 | `hnsw.ef_search` for the patent search; must be ≥ `NEIGHBOUR_K` (checked at startup), at most 1000 |
+| `PATENT_ENCODER_LOCAL_PATH` | unset | local PaECTER copy at the pinned revision |
+| `PATENT_ENCODER_DOWNLOAD_TIMEOUT_S` | 300 | bound on a Hugging Face download when there is no local copy |
+
+k, T and β were chosen on the IP India dev set in the offline experiment
+(`data/manifests/benchmarks/knn_hupd/report.json`). The minimum share has not been tuned on the served
+vote yet.
+
+### Memory
+
+With the vote on, the API holds three models. Measured on the dev machine (RTX 2050 4 GB, 15.7 GiB
+RAM) on 2026-10-14 with all three on CUDA:
+
+| | Value |
+| --- | --- |
+| Private commit after load | 7.3 GiB |
+| Peak commit during load | **about 8.3 GiB** (8.34) |
+| VRAM, without / with PaECTER | 1,159 / 1,819 MiB |
+
+- **OS error 1455** ("The paging file is too small for this operation to complete") on a cold start:
+  BGE-M3 and the reranker load, then PaECTER fails. This is the Windows commit limit (RAM plus page
+  file), not VRAM or disk. The API keeps serving with the fallback, and `/ready` shows the error in
+  `checks.neighbour_vote.patent_encoder_error`. **Restart the API once**: a system-managed page file
+  grows after the failed allocation, and the retry has worked. A larger fixed page file, or fewer open
+  applications, avoids it.
+- Always check `patent_encoder_state` after a start. The failure is easy to miss, because the API
+  still answers.
+
+## Patent corpus lifecycle
+
+A corpus moves through these states. Every step is a CLI command, writes a manifest to
+`data/manifests/patents/<step>_<corpus>.json` and holds an advisory lock on the corpus. Activation
+and retirement also hold a global serving lock.
+
+| Step | Command | State after | Notes |
+| --- | --- | --- | --- |
+| ingest | `ingest-patents` | `loading` | Reads the source, samples (seeded), keeps a hold-out out of the corpus, resolves labels against the serving taxonomy (WIPO concordance on by default). Idempotent upsert. |
+| embed | `embed-patents` | `embedded` | Resumable PaECTER embedding, or import of precomputed vectors (`--from-npy` with `--ids`; every imported document's text is checked). |
+| index | `build-patent-index` | `embedded` | Builds the corpus's own partial HNSW index. Refused while the corpus is serving. |
+| validate | `validate-patent-corpus` | `validated` | recall@k of the HNSW search against exact search (default 200 probes, k = `NEIGHBOUR_K`, minimum 0.95), and document count = embedding count. |
+| activate | `activate-patent-corpus` | serving | Refused unless validated with a valid index. Any other corpus stops serving. |
+| retire | `retire-patent-corpus` | `embedded` | Drops the index (`DROP INDEX CONCURRENTLY`). A serving corpus needs `--stop-serving`; the vote then falls back until another corpus is activated. |
+
+`load-patents` runs ingest → embed → index → validate in order, stops at the first failure, and
+resumes when the same command is run again. It skips an ingest that already completed with the same
+parameters. Once a corpus is embedded or validated, it refuses to ingest into it with different
+parameters, so a smoke load never passes for the real one (`--reingest` overrides; a new corpus id is
+the clean way).
+Activation is always a separate step.
+
+### HUPD (what is serving)
+
+The `hupd-2017` corpus was loaded with these commands on 2026-10-14 (from `apps/api`; vectors
+imported from the offline experiment):
+
+```bash
+uv run ipc --target sakthi load-patents --source hupd --years 2017 --corpus hupd-2017 \
+    --seed 20261013 --holdout 2000 --from-npy D:/ipc_knn/emb/paecter --ids D:/ipc_knn/corpus.jsonl \
+    --m 32 --ef-construction 200 --maintenance-work-mem 512MB
+uv run ipc --target sakthi activate-patent-corpus --corpus hupd-2017
+uv run ipc --target sakthi patent-status
+```
+
+The same load, step by step:
+
+```bash
+uv run ipc --target sakthi ingest-patents --source hupd --years 2017 --corpus hupd-2017 --seed 20261013 --holdout 2000
+uv run ipc --target sakthi embed-patents --corpus hupd-2017 --from-npy D:/ipc_knn/emb/paecter --ids D:/ipc_knn/corpus.jsonl
+uv run ipc --target sakthi build-patent-index --corpus hupd-2017 --m 32 --ef-construction 200 --maintenance-work-mem 512MB
+uv run ipc --target sakthi validate-patent-corpus --corpus hupd-2017
+uv run ipc --target sakthi activate-patent-corpus --corpus hupd-2017
+```
+
+HUPD tarballs (`YYYY.tar.gz`) are read from `HUPD_DATA_DIR` (default `D:/ipc_knn/raw/data`) or
+`--data-dir`. Without `--from-npy`, `embed-patents` encodes with PaECTER from `--model-path`, else
+`PATENT_ENCODER_LOCAL_PATH`, else the pinned Hugging Face snapshot (the same loader as the API).
+
+| hupd-2017 step | Result | Manifest |
+| --- | --- | --- |
+| ingest | 295,735 read, 2,000 held out, 293,711 selected, 26 with no resolvable label, **293,685 stored**; 148,239 labels resolved through the concordance; 401.4 s | `ingest_hupd-2017.json` |
+| embed | 293,685 imported, 0 text mismatches; 810.0 s | `embed_hupd-2017.json` |
+| index | m=32, ef_construction=200, maintenance_work_mem 512MB; **544.65 s, 749.6 MiB** | `index_hupd-2017.json` |
+| validate | 200 probes, k=100, ef_search 200: **recall@100 0.9884** (lowest probe 0.9596); HNSW p50 129 ms | `validate_hupd-2017.json` |
+| database size | 2.53 GB before → 3.68 GB after embed → **4.46 GB** after index | `db_size_hupd-2017.json` |
+
+### Index build on sakthi: `--maintenance-work-mem 512MB`
+
+A parallel HNSW build puts the graph in dynamic shared memory sized up to `maintenance_work_mem`,
+and sakthi's PostgreSQL has a small `/dev/shm`. With `2GB` the build failed after 1.1 s
+(`DiskFull: could not resize shared memory segment ... No space left on device`). With `512MB` (the
+server default) the 293,685-row index built in 545 s. Use `512MB` on sakthi. A failed index step keeps
+the ingest and embed work; re-running `load-patents` resumes at the index step.
+
+### After activating
+
+- **No API restart is needed.** The pipeline reads the serving corpus on every request.
+- **Run `POST /v1/admin/reload-confidence`** (`Authorization: Bearer $ADMIN_TOKEN`). The confidence
+  fingerprint includes the serving corpus's id and input hash, and it is only recomputed at startup
+  and on that call, so it is stale until then.
+- With the vote enabled, the fingerprint also includes the patent encoder and the vote settings. So
+  enabling the vote, or activating another corpus, marks any fitted calibrator
+  `incompatible_artifact`, including a reranker calibrator. No calibrator is fitted today; the open
+  item is recorded in ADR-0005.
+
+### USPTO grants (`--source uspto-odp`)
+
+The reader for recent USPTO grants ([uspto_odp.py](../apps/api/app/services/patents/sources/uspto_odp.py))
+needs a USPTO Open Data Portal API key. Put it in `.env` at the repository root, never in a command line
+or a committed file:
+
+```
+USPTO_ODP_API_KEY=<your key>
+```
+
+The key is sent only in a request header and is never logged. Without it, the reader stops before
+the first request with an error naming `USPTO_ODP_API_KEY`.
+
+**Not yet usable for a real load:**
+- The endpoint, query and field names (`odp_fields.py`) have never been checked against a live
+  response, because no key existed when it was written. Every `uspto-odp` run prints a warning saying so.
+- There is an open must-fix in the year paging (TASK-0004): a year ends once the records read reach
+  the response's `total_hits`. If the API caps or misreports that count, a year is cut short without an
+  error. Fix it before the first real USPTO load.
+
+Once both are resolved, check a small load in a separate corpus first, then load the full range:
+
+```bash
+uv run ipc --target sakthi load-patents --source uspto-odp --years 2021-2025 --corpus uspto-smoke \
+    --limit 2000 --m 32 --ef-construction 200 --maintenance-work-mem 512MB
+uv run ipc --target sakthi load-patents --source uspto-odp --years 2021-2025 --corpus uspto-2021-2025 \
+    --m 32 --ef-construction 200 --maintenance-work-mem 512MB
+uv run ipc --target sakthi activate-patent-corpus --corpus uspto-2021-2025
+```
+
+m and ef_construction must be measured for a corpus of that size: validation fails below recall@100
+0.95, and the remedy is `build-patent-index --replace` with larger values. The new corpus gets its own
+partial index next to the serving one, so `hupd-2017` keeps serving until the activation.
+
 ## Confidence calibration
 
 **The event being calibrated:** an expert accepts this code as a supported candidate at the
@@ -85,9 +269,17 @@ uv run ipc activate-calibrator data/calibration/cal-platt-XXXX.json --max-ece 0.
   version. Changing any of them changes the hash. Confidence then becomes `incompatible_artifact`
   with `score=null`, while retrieval keeps working. An input mode or level absent from the
   calibration data gives `unsupported_input_mode`.
-- **Current state:** no expert-labelled data was supplied, so **no calibrator is fitted or active**.
-  Every candidate reports `score: null, status: not_calibrated`, and the UI shows "confidence: not
-  calibrated".
+- **Current state:** no expert-labelled data was supplied, so **no calibrator is fitted or active**,
+  neither for reranker scores nor for vote shares.
+  - Vote codes (`classifier: neighbour_vote`) report the raw vote share at the code's own level:
+    `status: vote_share_uncalibrated`, `score` = the share. The summary shows "vote share: 87.9%",
+    and the UI shows the share followed by "(uncalibrated)". It is never called a probability or a
+    confidence.
+  - Definition-path codes report `score: null, status: not_calibrated`, and the UI shows
+    "confidence: not calibrated".
+  - The offline experiment found the vote share close to calibrated already
+    ([benchmark-ipindia.md](benchmark-ipindia.md#nearest-neighbour-vote-over-labelled-patents-offline-experiment-2026-10-13)),
+    but no calibrator has been fitted on the served vote.
 
 ## Label protocol
 

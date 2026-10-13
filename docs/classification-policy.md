@@ -1,11 +1,98 @@
 # Classification policy (before calibration)
 
-There is no fitted calibrator, so no numeric confidence threshold can exist yet. Whether a
-candidate is selected depends on a documented **relevance and evidence policy**. Its thresholds are
-heuristics in raw reranker-logit units. They are not probabilities, and expert-labelled data must
-replace them.
+Two classifiers share one pipeline ([pipeline.py](../apps/api/app/services/classification/pipeline.py)):
 
-## Pipeline
+- **The neighbour vote** (primary, when `NEIGHBOUR_VOTE_ENABLED=true`): the IPC codes of the most
+  similar labelled patents pick the codes and their order.
+- **Definition matching** (below): the abstract against IPC scheme text. It explains the vote's codes,
+  and it is the classifier whenever the vote is off, cannot run or is too weak.
+
+The response's `classifier` field says which one chose the codes, and `fallback_reason` says why the
+vote did not ([api.md](api.md)). The decision is ADR-0005 ("A PaECTER neighbour vote is the primary
+classifier").
+
+There is no fitted calibrator, so no numeric confidence threshold can exist yet. Vote codes carry
+their raw vote share, and the definition path's selection depends on a documented **relevance and
+evidence policy**. Its thresholds are heuristics in raw reranker-logit units. Neither is a
+probability, and expert-labelled data must replace them.
+
+## Neighbour vote (primary classifier)
+
+### Selection rule
+
+1. **Preconditions.** The vote runs only if it is enabled, a validated corpus is serving, PaECTER is
+   loaded, and its revision equals the one the corpus was embedded with. Otherwise the definition
+   pipeline answers, with the reason.
+2. **Search.** PaECTER encodes "title. abstract". The `NEIGHBOUR_K` (100) nearest corpus patents are
+   found through the serving corpus's partial HNSW index (`hnsw.ef_search` = `PATENT_HNSW_EF_SEARCH`,
+   200). Fewer than k rows is a failure (`vote_failed`), not a smaller vote.
+3. **Vote** ([neighbour_vote.py](../apps/api/app/services/classification/neighbour_vote.py)). Neighbour
+   n weighs `exp((s_n − s₁)/T)`, with s₁ the highest similarity. Its main label counts 1 and each
+   secondary label `NEIGHBOUR_BETA`, and it counts once per code at each level (subclass, main group,
+   exact code). A code's **vote share** is its weighted count over the total weight of all neighbours.
+   Patents carry several codes, so shares of different codes do not sum to 1.
+4. **First code,** always at the deepest level, chosen top-down: the best subclass, then the best main
+   group inside it, then the best exact code inside that main group. The exact code is a subgroup, or a
+   main group when patents are labelled with the main group itself.
+5. **Minimum share (the gate).** If the first code's **subclass** share, rounded to 4 decimals, is
+   below `NEIGHBOUR_MIN_VOTE_SHARE` (0.2), the definition pipeline answers instead
+   (`fallback_reason: vote_below_minimum`; the weak vote is still returned in `vote`). The 0.2 is
+   **provisional**: it has not been tuned on the served vote.
+6. **Codes reported,** in vote order:
+   - the first code, reported as its ancestor when `target_level` is coarser;
+   - then codes from the vote ranking at the requested level whose rounded own-level share is ≥ the
+     same minimum share, skipping any code that is an ancestor or descendant of one already chosen;
+   - `max_results` is a ceiling; up to as many again go to alternatives ("Beyond max_results ceiling.").
+
+   | `target_level` | Ranking used for further codes |
+   | --- | --- |
+   | `class` | class shares (any code in the class) |
+   | `subclass` | subclass shares |
+   | `maingroup` | main-group shares |
+   | `group` | the neighbours' exact label codes: subgroups, and main groups labelled as such |
+   | `subgroup` | the exact label codes that are subgroups |
+
+7. **Explanation, never veto.** The definition path then runs on the vote's codes only: hydrate,
+   rerank (scores only; it never reorders the vote), and evidence passages. A missing or weak passage
+   and the lexical scope checks become review notes. They never remove a vote code.
+8. **Rules arbitrate only.** WIPO precedence rules (`APPLY_PRECEDENCE_RULES`) are applied between vote
+   codes as on the definition path. An unconditional demotion moves a code to alternatives with the
+   rule quoted. A rule never adds a code: the preferred place must itself be a vote code. If the first
+   code yields, the code it yields to leads. If a cycle of rules would demote every code, the first
+   code stays with a note.
+9. **Status** is `needs_review` while vote shares are uncalibrated. `insufficient_evidence` cannot
+   happen with the vote: there is always at least the first code.
+
+Also:
+- `section` / `subclass` request filters apply to definition matching only. The vote ignores them and
+  says so in `warnings`.
+- `use_llm` is not applied to vote codes (warning).
+- A vote code missing from the taxonomy release is dropped with a warning. If the first code is
+  missing, the vote counts as failed (`vote_failed`) and the definition pipeline answers.
+- If the vote could not run at all (`no_serving_corpus`, `patent_encoder_unavailable`, `vote_empty`,
+  `vote_failed`) and the definition pipeline cannot serve either, the API returns 503
+  `patent_corpus_unavailable`.
+
+### Edge cases to know when reading a response
+
+- **The first candidate can be coarser than requested.** With `target_level` `subgroup` or
+  `maingroup`, `candidates[0]` is the vote's first code at its own level when that code is coarser
+  than requested, for example a main group for a `subgroup` request, or a subclass when no main group
+  was voted. The definition path never does this: it only returns codes of the requested level.
+- **Main groups at `target_level=group`.** The ranking holds the neighbours' exact label codes, so a
+  main group appears when patents are labelled with the main group itself. It is gated and scored by
+  its **main-group share** (any code in that main group), not by the share labelled with exactly that
+  main group.
+- **Place-rule demotions don't reorder.** With `APPLY_PLACE_RULES=true` (off by default), a place rule
+  can demote the first code, but the code it yields to is not moved to the front. The winner is found
+  by matching the precedence wording "(X takes precedence" in the demotion reason, which a place rule
+  doesn't have. The next code in vote order leads instead. In the QKD example, H04L 9/08 carries
+  "WIPO place rule (not applied)" notes naming the last-place rule for H04L 9/06–9/32.
+
+## Definition pipeline (explanation and fallback)
+
+The rest of this document describes definition matching. With the vote primary, only steps 5 and 6
+(reranking and evidence) and the WIPO rules run, on the vote's codes.
 
 1. **Query views** ([query_views.py](../apps/api/app/services/retrieval/query_views.py)):
    - An abstract (+title) view is always built. It is the only view for an abstract-only request.
@@ -67,7 +154,7 @@ replace them.
    the best abstract passage, and adds the best optional-document passage only when it scores higher.
    Every quote is checked so that `field[start:end] == quote`.
 
-## Selection rules, policy v2 ([pipeline.py `_apply_policy`](../apps/api/app/services/classification/pipeline.py))
+## Selection rules on the definition path, policy v2 ([pipeline.py `_apply_policy`](../apps/api/app/services/classification/pipeline.py))
 
 Policy v1 rejected candidates on lexical heuristics and absolute logit floors. On the IP India
 benchmark it abstained on 87% of real applications and rejected the correct candidate almost every
@@ -126,7 +213,7 @@ When `LLM_ENABLED=true` and the request sets `use_llm=true`:
 
 ## Why these defaults
 
-The values were chosen by grid search on the 130-application IP India dev set:
+These are the definition path's thresholds. The values were chosen by grid search on the 130-application IP India dev set:
 - floor ∈ {off, −6 … −1};
 - gap ∈ {0.25 … 3};
 - evidence ∈ {off, −6 … −2};
@@ -143,9 +230,10 @@ and ties broken by set-F1. Effect of the lexical checks on dev, with the other s
 | subclass-scope only | 17.7% | 28.5% | 14.6% |
 | all three | 30.8% | 21.5% | 11.5% |
 
-**Known trade-off:**
-- The QKD contract example now selects H04W 12/0433 "Key management protocols". It carries a review
-  note that the H04W "wireless" scope isn't evidenced.
+**Known trade-off (definition path only):**
+- With the vote off, the QKD contract example selects H04W 12/0433 "Key management protocols". It
+  carries a review note that the H04W "wireless" scope isn't evidenced. With the vote on it returns
+  H04L 9/08 at 87.9% vote share ([README](../README.md)).
 - Under v1, the subclass-scope check had demoted it in favour of H04L 9/08, which is now an
   alternative.
 - The example was not used to tune the policy.
