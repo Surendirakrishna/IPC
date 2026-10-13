@@ -125,6 +125,119 @@ def test_index_work_refuses_an_open_transaction() -> None:
         ix.activate_corpus(conn, "it-test-u")  # type: ignore[arg-type]
 
 
+# --- review fixes, wave 3: rebuild/retire ordering, concurrent drop, session settings ------------------------
+
+
+class _RecordingConn:
+    """Idle psycopg-like connection that logs every statement and answers each with (1,).
+
+    ``fail_on`` makes the first statement starting with that text raise (a lock timeout, a bad setting)."""
+
+    def __init__(self, log: list[str], fail_on: str | None = None, error: Exception | None = None) -> None:
+        self.info = SimpleNamespace(transaction_status=TransactionStatus.IDLE)
+        self.autocommit = False
+        self.log = log
+        self.fail_on = fail_on
+        self.error = error or RuntimeError("boom")
+
+    def execute(self, stmt: Any, params: Any = None) -> SimpleNamespace:
+        text = stmt if isinstance(stmt, str) else stmt.as_string(None)
+        self.log.append(text)
+        if self.fail_on and text.startswith(self.fail_on):
+            self.fail_on = None
+            raise self.error
+        return SimpleNamespace(fetchone=lambda: (1,))
+
+    def rollback(self) -> None:
+        pass
+
+
+@pytest.fixture
+def recording(monkeypatch: pytest.MonkeyPatch):
+    log: list[str] = []
+    state: dict[str, Any] = {"corpus": _corpus("validated"), "index": {"valid": True, "problems": [], "bytes": 1,
+                                                                        "definition": "old"}}  # fmt: skip
+    monkeypatch.setattr(ix.patents, "get_corpus", lambda conn, cid: state["corpus"])
+    monkeypatch.setattr(ix, "corpus_index", lambda conn, cid: state["index"])
+
+    def set_state(conn, cid, new_state, **kw):  # noqa: ANN001, ANN003
+        if state["corpus"].is_serving:
+            raise CorpusStateError("serving")
+        log.append(f"state:{new_state}")
+        state["corpus"] = replace(state["corpus"], state=new_state)
+        return state["corpus"]
+
+    monkeypatch.setattr(ix.patents, "set_corpus_state", set_state)
+    monkeypatch.setattr(ix.patents, "unset_serving_corpus", lambda conn: log.append("unset_serving"))
+    return log, state
+
+
+def test_drop_is_concurrent() -> None:
+    assert ix.drop_index_statement("patent_hnsw_x_1").as_string(None) == (
+        'DROP INDEX CONCURRENTLY IF EXISTS "patent_hnsw_x_1"')
+
+
+def test_build_refuses_a_serving_corpus_before_any_statement(recording) -> None:
+    log, state = recording
+    state["corpus"] = _corpus("validated", serving=True)
+    conn = _RecordingConn(log)
+    for replace_ in (False, True):
+        with pytest.raises(CorpusStateError, match="is serving"):
+            ix.build_patent_index(conn, "it-test-u", m=16, ef_construction=64, replace=replace_)  # type: ignore[arg-type]
+    assert log == []  # nothing dropped, no state change
+
+
+def test_replacing_a_validated_index_unvalidates_first_then_drops_concurrently(recording) -> None:
+    log, state = recording
+    out = ix.build_patent_index(_RecordingConn(log), "it-test-u", m=16, ef_construction=64,  # type: ignore[arg-type]
+                                replace=True)  # fmt: skip
+    name = ix.index_name("it-test-u")
+    i_state = log.index("state:embedded")
+    i_drop = log.index(f'DROP INDEX CONCURRENTLY IF EXISTS "{name}"')
+    i_create = next(i for i, s in enumerate(log) if s.startswith("CREATE INDEX"))
+    assert i_state < i_drop < i_create
+    assert log[i_drop - 1] == "SET lock_timeout = '5s'" and log[i_drop + 1] == "RESET lock_timeout"
+    assert out["status"] == "created" and out["state"] == "embedded" and out["state_before"] == "validated"
+    assert state["corpus"].state == "embedded"
+
+
+def test_a_drop_that_times_out_fails_cleanly(recording) -> None:
+    from psycopg import errors
+
+    log, _ = recording
+    conn = _RecordingConn(log, fail_on="DROP INDEX", error=errors.LockNotAvailable("lock timeout"))
+    with pytest.raises(errors.LockNotAvailable):
+        ix.build_patent_index(conn, "it-test-u", m=16, ef_construction=64, replace=True)  # type: ignore[arg-type]
+    assert log[-1] == "RESET lock_timeout" and not any(s.startswith("CREATE INDEX") for s in log)
+    assert conn.autocommit is False  # restored
+
+
+def test_session_settings_are_reset_when_a_set_fails(recording) -> None:
+    log, state = recording
+    state["index"] = None  # first build
+    conn = _RecordingConn(log, fail_on="SET maintenance_work_mem")
+    with pytest.raises(RuntimeError, match="boom"):
+        ix.build_patent_index(conn, "it-test-u", m=16, ef_construction=64,  # type: ignore[arg-type]
+                              maintenance_work_mem="not-a-size")  # fmt: skip
+    assert log[-3:] == ["RESET lock_timeout", "RESET statement_timeout", "RESET maintenance_work_mem"]
+
+
+def test_retire_unvalidates_before_a_concurrent_drop(recording, monkeypatch: pytest.MonkeyPatch) -> None:
+    log, state = recording
+    state["corpus"] = _corpus("validated", serving=True)
+
+    def unset(conn):  # noqa: ANN001
+        log.append("unset_serving")
+        state["corpus"] = replace(state["corpus"], is_serving=False)
+
+    monkeypatch.setattr(ix.patents, "unset_serving_corpus", unset)
+    out = ix.retire_corpus(_RecordingConn(log), "it-test-u", stop_serving=True)  # type: ignore[arg-type]
+    name = ix.index_name("it-test-u")
+    assert log.index("unset_serving") < log.index("state:embedded") < log.index(
+        f'DROP INDEX CONCURRENTLY IF EXISTS "{name}"')
+    assert out["state"] == "embedded" and out["dropped"]
+
+
 # --- integration: sakthi with an explicit opt-in (or a local database) ---------------------------------------
 
 TEST_PREFIX = "it-test-"
@@ -280,6 +393,8 @@ def test_build_validate_activate_beside_a_coexisting_corpus(db_conn) -> None:
     assert report["passed"], report["reasons"]
     assert report["probes"] == 200 and report["shortfalls"] == 0
     assert report["recall_at_k"] >= 0.95 and report["plan_uses_index"] and report["exact_plan_avoids_index"]
+    assert report["recall_at_k_with_self"] >= report["recall_at_k"] - 0.01  # self-hit excluded from the gated value
+    assert report["planner_gate_applied"] is False  # 300 rows < 10,000: the unforced plan is only recorded
     assert report["state"] == "validated"
     corpus = patents.get_corpus(conn, a)
     conn.rollback()
@@ -295,6 +410,13 @@ def test_build_validate_activate_beside_a_coexisting_corpus(db_conn) -> None:
     conn.rollback()
     assert serving == [(b,)]  # one serving corpus at most
 
+    # A1: the serving corpus's index can be neither rebuilt nor replaced; it stays valid and serving
+    for replace_ in (False, True):
+        with pytest.raises(CorpusStateError, match="is serving"):
+            ix.build_patent_index(conn, b, m=16, ef_construction=64, replace=replace_)
+    assert ix.corpus_index(conn, b)["valid"] and patents.get_corpus(conn, b).is_serving
+    conn.rollback()
+
     retired = ix.retire_corpus(conn, b, stop_serving=True)
     assert retired == {"corpus_id": b, "index": ix.index_name(b), "was_serving": True, "state_before": "validated",
                        "dropped": True, "state": "embedded"}  # fmt: skip
@@ -302,6 +424,15 @@ def test_build_validate_activate_beside_a_coexisting_corpus(db_conn) -> None:
     with pytest.raises(CorpusStateError):
         ix.activate_corpus(conn, b)  # needs re-indexing and re-validation
     assert ix.corpus_index(conn, a)["valid"]  # retiring b left a's index alone
+
+    # A1: replacing a validated (not serving) corpus's index unvalidates it; it must be validated again
+    rebuilt = ix.build_patent_index(conn, a, m=16, ef_construction=64, replace=True)
+    assert rebuilt["status"] == "created" and rebuilt["state_before"] == "validated" and rebuilt["state"] == "embedded"
+    assert rebuilt["replaced"] == built["definition"] and ix.corpus_index(conn, a)["valid"]
+    assert patents.get_corpus(conn, a).state == "embedded"
+    conn.rollback()
+    with pytest.raises(CorpusStateError, match="validate it before activating"):
+        ix.activate_corpus(conn, a)
 
 
 @pytest.mark.integration
@@ -336,10 +467,22 @@ def test_refusals_and_failed_validation(db_conn, monkeypatch: pytest.MonkeyPatch
         found = real_search(conn_, corpus_id, vec, k, ef)
         return found[: k // 2] + [replace(n, document_id=f"not-{n.document_id}", similarity=-1.0) for n in found[k // 2:]]
 
+    # B4 first: on a 150-row corpus the unforced planner prefers the primary key; with the gate lowered to 100 rows
+    # that is a failure, recorded with the plan.
+    gated = ix.validate_corpus(conn, good, probes=5, k=100, ef_search=200, planner_gate_rows=100)
+    assert gated["planner_gate_applied"] is True
+    assert gated["passed"] is gated["planner_default_uses_index"]  # passes only if the unforced plan uses the index
+    if not gated["passed"]:
+        assert any("the planner does not choose the corpus index for the unforced search" in r for r in gated["reasons"])
+        assert patents.get_corpus(conn, good).state == "embedded"
+        conn.rollback()
+
     monkeypatch.setattr(ix, "search_patents", half_wrong)
     report = ix.validate_corpus(conn, good, probes=10, k=100, ef_search=200)
-    assert not report["passed"] and report["recall_at_k"] == 0.5 and report["state"] == "embedded"
-    assert any(r.startswith("recall@100 0.5 < threshold 0.95") for r in report["reasons"])
+    # 50 of 100 rows are right, one of them the probe itself: 49 of the 99 real neighbours without the self-hit
+    assert report["recall_at_k_with_self"] == 0.5 and report["recall_at_k"] == round(49 / 99, 4)
+    assert not report["passed"] and report["state"] == "embedded"
+    assert any(r.startswith("recall@100 0.4949 < threshold 0.95") for r in report["reasons"])
 
     def short(conn_, corpus_id, vec, k, ef):  # noqa: ANN001
         raise NeighbourShortfall(corpus_id, k, real_search(conn_, corpus_id, vec, k, ef)[:90])
