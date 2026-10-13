@@ -1,25 +1,52 @@
 "use client";
 
 import Link from "next/link";
-import type { Alternative, Candidate, Confidence, TechnicalScores } from "@/lib/types";
+import type { Alternative, Candidate, Confidence, ConfidenceStatus, PathEntry, TechnicalScores, VoteShare } from "@/lib/types";
 import { HighlightedField, PassageList } from "./Evidence";
+
+/** Share in [0, 1] -> "79.1%" (same rounding as the server's confidence_text). */
+export const pct = (v: number) => `${(Math.round(v * 1000) / 10).toFixed(1)}%`;
+
+/**
+ * Short score label for a collapsed card, worded by confidence.status (contract 2.0): only `calibrated`
+ * is a probability; `vote_share_uncalibrated` is a raw vote share and is never called a probability.
+ */
+export function scoreLabel(c: Confidence): string | null {
+  if (c.score === null) return null;
+  if (c.status === "calibrated") return `Probability ${pct(c.score)}`;
+  if (c.status === "vote_share_uncalibrated") return `vote share ${pct(c.score)}`;
+  return null;
+}
 
 function ConfidenceView({ c }: { c: Confidence }) {
   if (c.status === "calibrated" && c.score !== null) {
     return (
       <div className="text-sm">
-        <span className="font-semibold">Confidence: {(Math.round(c.score * 1000) / 10).toFixed(1)}%</span>
+        <span className="font-semibold">Probability {pct(c.score)}</span>
         <span className="ml-2 text-xs text-zinc-500">calibrator {c.calibrator_id}</span>
         {c.interpretation && <p className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">{c.interpretation}</p>}
       </div>
     );
   }
-  const label = {
+  if (c.status === "vote_share_uncalibrated" && c.score !== null) {
+    return (
+      <div className="text-sm">
+        <span className="font-semibold">Vote share: {pct(c.score)}</span>
+        <span className="ml-2 text-xs text-zinc-500">(uncalibrated)</span>
+        {c.interpretation && <p className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">{c.interpretation}</p>}
+        {c.detail && <p className="text-xs text-zinc-500">{c.detail}</p>}
+      </div>
+    );
+  }
+  // Exhaustive over ConfidenceStatus so a new status fails the type check instead of rendering undefined.
+  const labels: Record<ConfidenceStatus, string> = {
     not_calibrated: "Confidence: not calibrated",
     incompatible_artifact: "Confidence: calibrator incompatible with this pipeline",
     unsupported_input_mode: "Confidence: not calibrated for this input mode",
     calibrated: "Confidence: not available",
-  }[c.status];
+    vote_share_uncalibrated: "Vote share: not available",
+  };
+  const label = labels[c.status];
   return (
     <div className="text-sm">
       <span className="italic">{label}</span>
