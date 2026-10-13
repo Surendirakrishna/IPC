@@ -57,6 +57,7 @@ async def classify(req: ClassifyRequest, request: Request) -> ClassifyResponse:
             status = 413 if exc.code == "request_too_large" else 422
             raise ApiError(status, exc.code, str(exc), exc.details) from exc
         except PipelineUnavailable as exc:
-            raise ApiError(503, exc.code, str(exc)) from exc
+            # details carries {reason, fallback_error} for patent_corpus_unavailable (docs/api.md); None otherwise.
+            raise ApiError(503, exc.code, str(exc), exc.details) from exc
         except DatabaseNotConfigured as exc:
             raise ApiError(503, "database_unavailable", str(exc)) from exc
