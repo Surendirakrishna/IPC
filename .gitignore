@@ -35,3 +35,7 @@ Thumbs.db
 
 # Raw third-party pages fetched for benchmarks (parsed JSONL is kept)
 data/evaluation/ipindia_raw/
+
+# Claude Code agent worktrees and agent memory (local only)
+.claude/worktrees/
+**/.claude/agent-memory/
