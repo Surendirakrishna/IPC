@@ -9,8 +9,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import time
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 
@@ -233,11 +237,611 @@ def estimate_storage(
     _echo(out)
 
 
-def _load_pipeline():
-    """Load models + pipeline in-process (same code path as the API)."""
-    from app.runtime import get_runtime
+# --- Patent corpus (ADR-0005, TASK-0009) ---------------------------------------------------------------------
+# Wiring only: the work is in services.patents (ingest, embed, index) and db.patents. Each lifecycle command holds
+# a session-level advisory lock on its corpus for its whole run (activation and retirement also a global one), so
+# a second command on the same corpus fails fast instead of interleaving (wave 3 review B5).
 
-    rt = get_runtime()
+PATENT_SOURCES = ("hupd", "uspto-odp")
+DEFAULT_PATENT_SEED = 20261013
+LOCK_NAMESPACE_CORPUS = 727_001  # pg_try_advisory_lock(727001, hashtext(corpus_id))
+LOCK_NAMESPACE_GLOBAL = 727_002  # pg_try_advisory_lock(727002, 0): serving changes
+LOAD_STEPS = ("ingest", "embed", "index", "validate")
+USPTO_UNVERIFIED_WARNING = (
+    "WARNING: the USPTO Open Data Portal reader is UNVERIFIED: its endpoint, query and field names have never been "
+    "checked against a live response (no USPTO_ODP_API_KEY yet), and its year paging has an open review finding "
+    "(TASK-0004). Inspect the first pages and the ingest manifest before trusting a large load."
+)
+
+
+class PatentLockBusy(RuntimeError):
+    """Another ipc command holds the advisory lock for this corpus (or for serving changes)."""
+
+
+def _patent_errors() -> tuple[type[BaseException], ...]:
+    """Expected failures of the patent commands: reported as one clear line and exit code 1. Anything else is a
+    bug and keeps its traceback."""
+    import psycopg
+
+    from app.db.patents import PatentCorpusError
+    from app.db.session import DatabaseNotConfigured
+    from app.services.embeddings.paecter import PaecterError
+    from app.services.patents.concordance import ConcordanceError
+    from app.services.patents.embed import PatentEmbedError
+    from app.services.patents.index import PatentIndexError
+    from app.services.patents.ingest import IngestError
+    from app.services.patents.sources.uspto_odp import UsptoReaderError
+
+    return (PatentLockBusy, PatentCorpusError, DatabaseNotConfigured, PaecterError, ConcordanceError,
+            PatentEmbedError, PatentIndexError, IngestError, UsptoReaderError, psycopg.Error, FileNotFoundError,
+            ValueError, typer.BadParameter)  # fmt: skip
+
+
+def _describe(exc: BaseException) -> str:
+    import psycopg
+
+    if isinstance(exc, (psycopg.errors.LockNotAvailable, psycopg.errors.QueryCanceled)):
+        return (f"{type(exc).__name__}: a lock on patent_embeddings was not granted within the lock timeout (vote "
+                f"searches or another job hold it); nothing was dropped. Retry later. ({str(exc).strip()})")
+    from app.services.patents.ingest import HoldoutLeak
+
+    if isinstance(exc, typer.BadParameter):
+        return str(exc)
+    if isinstance(exc, HoldoutLeak):
+        return (f"HoldoutLeak: {str(exc).strip()} (the ingest manifest lists them; --allow-holdout-leak stores "
+                "anyway, which is only right if the hold-out is not used for evaluation)")
+    return f"{type(exc).__name__}: {str(exc).strip()}"
+
+
+def _fail(message: str) -> None:
+    typer.echo(f"error: {message}", err=True)
+    raise typer.Exit(1)
+
+
+@contextmanager
+def _patent_errors_reported() -> Iterator[None]:
+    try:
+        yield
+    except _patent_errors() as exc:
+        _fail(_describe(exc))
+
+
+@contextmanager
+def _advisory_lock(conn: Any, namespace: int, corpus_id: str | None, what: str) -> Iterator[None]:
+    """Hold a session-level advisory lock for the block; refuse at once if another session holds it.
+
+    Session-level locks survive the rollback that ends the lock statement's transaction, so the connection is idle
+    again for the services (index work needs an idle connection) while the lock stays held until unlocked or the
+    connection closes."""
+    key = "0" if corpus_id is None else "hashtext(%s)"
+    params = [namespace] if corpus_id is None else [namespace, corpus_id]
+    got = conn.execute(f"SELECT pg_try_advisory_lock(%s, {key})", params).fetchone()[0]  # key is one of two literals
+    conn.rollback()
+    if not got:
+        raise PatentLockBusy(f"another ipc command holds the {what} lock; wait for it to finish (`ipc patent-status` "
+                             "shows the corpus state) and re-run. Nothing was changed.")  # fmt: skip
+    try:
+        yield
+    finally:
+        try:
+            conn.rollback()
+            conn.execute(f"SELECT pg_advisory_unlock(%s, {key})", params)
+            conn.rollback()
+        except Exception:  # noqa: BLE001 - a broken connection releases its locks when it closes
+            log.debug("advisory unlock failed; the lock goes with the connection", exc_info=True)
+
+
+@contextmanager
+def _patent_job(corpus_id: str, *, serving_change: bool = False) -> Iterator[Any]:
+    """A direct connection holding the corpus lock (and the global serving lock when ``serving_change``)."""
+    from app.db.session import connect_direct
+
+    with connect_direct() as conn, ExitStack() as locks:
+        if serving_change:
+            locks.enter_context(_advisory_lock(conn, LOCK_NAMESPACE_GLOBAL, None, "patent serving (activation)"))
+        locks.enter_context(_advisory_lock(conn, LOCK_NAMESPACE_CORPUS, corpus_id, f"patent corpus {corpus_id!r}"))
+        yield conn
+
+
+def _manifest_name(corpus_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", corpus_id)  # ':' is allowed in corpus ids but not in Windows file names
+
+
+def _write_patent_manifest(step: str, corpus_id: str, payload: dict) -> Path:
+    from app.services.ingestion.importer import write_manifest
+
+    return write_manifest(get_settings().manifests_dir / "patents", f"{step}_{_manifest_name(corpus_id)}", payload)
+
+
+def _read_patent_manifest(step: str, corpus_id: str) -> dict | None:
+    path = get_settings().manifests_dir / "patents" / f"{step}_{_manifest_name(corpus_id)}.json"
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _parse_years(value: str | None) -> list[int]:
+    """"2017", "2021-2025" or "2017,2019"."""
+    if not value or not value.strip():
+        raise typer.BadParameter("--years is required, e.g. 2017 or 2021-2025")
+    years: list[int] = []
+    for part in value.split(","):
+        part = part.strip()
+        m = re.fullmatch(r"(\d{4})(?:-(\d{4}))?", part)
+        if not m:
+            raise typer.BadParameter(f"--years: {part!r} is not YYYY or YYYY-YYYY")
+        lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+        if hi < lo:
+            raise typer.BadParameter(f"--years: {part!r} ends before it starts")
+        years += [y for y in range(lo, hi + 1) if y not in years]
+    return years
+
+
+def _check_source(source: str) -> None:
+    if source not in PATENT_SOURCES:
+        raise typer.BadParameter(f"--source must be one of {', '.join(PATENT_SOURCES)}")
+
+
+class LimitedReader:
+    """The first ``limit`` records of a re-iterable reader, itself re-iterable (ingest samples in two passes)."""
+
+    def __init__(self, reader: Any, limit: int) -> None:
+        self.reader, self.limit = reader, limit
+
+    @property
+    def stats(self) -> Any:
+        return getattr(self.reader, "stats", None)
+
+    def __iter__(self) -> Iterator[Any]:
+        import itertools
+
+        return itertools.islice(iter(self.reader), self.limit)
+
+
+def _patent_reader(source: str, years: list[int], limit: int | None, data_dir: Path | None) -> tuple[Any, dict]:
+    s = get_settings()
+    if source == "hupd":
+        from app.services.patents.sources.hupd import HupdReader
+
+        directory = data_dir or s.hupd_data_dir
+        reader: Any = HupdReader.for_years(directory, years)
+        if limit is not None:
+            reader = LimitedReader(reader, limit)
+        return reader, {"source": source, "years": years, "limit": limit, "data_dir": str(directory)}
+    from app.services.patents.sources.uspto_odp import UsptoOdpReader
+
+    return UsptoOdpReader(years, s.uspto_odp_api_key, limit=limit), {"source": source, "years": years, "limit": limit}
+
+
+def _catalogue(conn: Any, version: str) -> set[str]:
+    """Display codes of the taxonomy release the labels are resolved against."""
+    rows = conn.execute("SELECT display_code FROM ipc_records WHERE taxonomy_version = %s", [version]).fetchall()
+    conn.rollback()
+    return {r[0] for r in rows}
+
+
+def _load_concordance_if_present(enabled: bool, catalogue: set[str]) -> tuple[Any, str]:
+    """(concordance or None, why). Loaded from data/source/ when its WIPO lists are there (TASK-0015)."""
+    from app.services.patents.concordance import FILE_GLOB, load_concordance
+
+    if not enabled:
+        return None, "disabled (--no-concordance)"
+    directory = get_settings().source_dir
+    if not any(directory.glob(FILE_GLOB)):
+        return None, f"not applied: no {FILE_GLOB} in {directory}"
+    conc = load_concordance(directory, catalogue=catalogue)
+    return conc, f"applied: {len(getattr(conc, 'sources', []))} WIPO concordance list(s) from {directory}"
+
+
+def _corpus_row(conn: Any, corpus_id: str) -> Any:
+    from app.db import patents
+
+    try:
+        return patents.get_corpus(conn, corpus_id)
+    finally:
+        conn.rollback()
+
+
+def _ingest_parameters(source: str, years: list[int], limit: int | None, sample: int | None, seed: int,
+                       holdout: int, concordance: bool) -> dict:  # fmt: skip
+    """What a completed ingest is compared on when ``load-patents`` decides whether to resume past it."""
+    return {"source": source, "years": years, "limit": limit, "sample": sample, "seed": seed, "holdout": holdout,
+            "concordance": concordance}  # fmt: skip
+
+
+def _ingest_step(conn: Any, corpus_id: str, *, source: str, years: list[int], limit: int | None, sample: int | None,
+                 seed: int, holdout: int, allow_holdout_leak: bool, concordance: bool, data_dir: Path | None,
+                 label_ipc_edition: str | None, description: str | None, batch: int) -> dict:  # fmt: skip
+    from app.services.patents.ingest import HoldoutLeak, ingest
+
+    s = get_settings()
+    version = _active_version(conn)
+    conn.rollback()
+    catalogue = _catalogue(conn, version)
+    conc, conc_note = _load_concordance_if_present(concordance, catalogue)
+    reader, source_parameters = _patent_reader(source, years, limit, data_dir)
+    parameters = _ingest_parameters(source, years, limit, sample, seed, holdout, concordance)
+    extra = {"concordance_applied": conc is not None, "concordance_note": conc_note, "parameters": parameters}
+    try:
+        manifest = ingest(
+            reader, corpus_id, catalogue, seed=seed, sample_size=sample, holdout_size=holdout, concordance=conc,
+            repository=conn, encoder_model_id=s.patent_encoder_model_id,
+            encoder_model_revision=s.patent_encoder_model_revision, description=description,
+            label_ipc_edition=label_ipc_edition, labels_taxonomy_version=version, source_parameters=source_parameters,
+            batch_size=batch, allow_holdout_leak=allow_holdout_leak,
+        )  # fmt: skip
+    except HoldoutLeak as exc:
+        _write_patent_manifest("ingest", corpus_id, {**exc.manifest, **extra, "completed": False, "error": str(exc)})
+        raise
+    manifest = {**manifest, **extra, "completed": True}
+    _write_patent_manifest("ingest", corpus_id, manifest)
+    return manifest
+
+
+def _patent_encoder(model_path: Path | None) -> Any:
+    from app.runtime import patent_encoder_local_path
+    from app.services.embeddings.paecter import PaecterEncoder
+
+    s = get_settings()
+    return PaecterEncoder.load(local_path=model_path or patent_encoder_local_path(s),
+                               model_id=s.patent_encoder_model_id, revision=s.patent_encoder_model_revision,
+                               device=s.embedding_device)  # fmt: skip
+
+
+def _embed_step(conn: Any, corpus_id: str, *, batch: int, from_npy: Path | None, ids: Path | None,
+                model_path: Path | None) -> dict:  # fmt: skip
+    """Import precomputed vectors (if given), then embed whatever still lacks a vector with PaECTER, then finalize.
+    Both services skip documents that already have a vector, so a re-run resumes."""
+    from app.db.patents import CorpusNotFound
+    from app.services.embeddings.paecter import PatentEncodingPolicy
+    from app.services.patents.embed import (
+        DbEmbeddingStore,
+        PrecomputedSource,
+        embed_corpus,
+        finalize_corpus,
+        import_precomputed,
+    )
+
+    if (from_npy is None) != (ids is None):
+        raise typer.BadParameter("--from-npy and --ids go together (the shards and their id list)")
+    t0 = time.perf_counter()
+    store = DbEmbeddingStore(conn)
+    out: dict[str, Any] = {"corpus_id": corpus_id, "from_npy": str(from_npy) if from_npy else None,
+                           "ids": str(ids) if ids else None, "batch": batch}  # fmt: skip
+    if from_npy is not None:
+        src = PrecomputedSource.from_directory(from_npy, ids, with_texts=True)
+        out["import"] = import_precomputed(store, corpus_id, src, batch_size=batch).as_dict()
+    corpus = store.corpus(corpus_id)
+    if corpus is None:
+        raise CorpusNotFound(f"corpus {corpus_id!r} not found (run ingest-patents first)")
+    documents, embedded = store.counts(corpus_id)
+    if documents > embedded:
+        out["embed"] = embed_corpus(store, corpus_id, _patent_encoder(model_path), page_size=batch).as_dict()
+    elif corpus.state != "embedded":  # nothing left to encode: record the input hash without loading PaECTER
+        policy = PatentEncodingPolicy(model_id=corpus.encoder_model_id, model_revision=corpus.encoder_model_revision)
+        out["finalize"] = finalize_corpus(store, corpus_id, policy).as_dict()
+    documents, embedded = store.counts(corpus_id)
+    final = store.corpus(corpus_id)
+    out.update(documents=documents, embedded=embedded, state=final.state if final else None,
+               input_hash=final.input_hash if final else None, seconds=round(time.perf_counter() - t0, 1))
+    _write_patent_manifest("embed", corpus_id, out)
+    return out
+
+
+def _index_step(conn: Any, corpus_id: str, *, m: int, ef_construction: int, maintenance_work_mem: str | None,
+                replace: bool = False, concurrently: bool = False) -> dict:  # fmt: skip
+    from app.services.patents.index import build_patent_index
+
+    manifest = build_patent_index(conn, corpus_id, m=m, ef_construction=ef_construction,
+                                  maintenance_work_mem=maintenance_work_mem, replace=replace,
+                                  concurrently=concurrently)  # fmt: skip
+    _write_patent_manifest("index", corpus_id, manifest)
+    return manifest
+
+
+def _validate_step(conn: Any, corpus_id: str, *, probes: int, min_recall: float, k: int | None) -> dict:
+    from app.services.patents.index import validate_corpus
+
+    manifest = validate_corpus(conn, corpus_id, probes=probes, k=k or get_settings().neighbour_k, threshold=min_recall)
+    _write_patent_manifest("validate", corpus_id, manifest)
+    return manifest
+
+
+def _ingest_done(conn: Any, corpus_id: str, parameters: dict) -> str | None:
+    """Why a completed ingest can be skipped on a re-run (same parameters, corpus still as it left it), or None."""
+    corpus = _corpus_row(conn, corpus_id)
+    if corpus is None:
+        return None
+    if corpus.state in ("embedded", "validated"):
+        return f"corpus is {corpus.state}"
+    last = _read_patent_manifest("ingest", corpus_id)
+    if (corpus.state == "loading" and last and last.get("completed") and last.get("parameters") == parameters
+            and last.get("corpus_document_count") == corpus.document_count):  # fmt: skip
+        return f"a completed ingest with these parameters left {corpus.document_count} documents"
+    return None
+
+
+# Shared options.
+CorpusOpt = Annotated[str, typer.Option("--corpus", help="Corpus id, e.g. hupd-2017 (letters, digits, . _ : -)")]
+SourceOpt = Annotated[str, typer.Option("--source", help="hupd or uspto-odp")]
+YearsOpt = Annotated[str, typer.Option("--years", help="Filing (HUPD) or grant (USPTO) years: 2017, 2021-2025, 2017,2019")]
+LimitOpt = Annotated[int | None, typer.Option("--limit", min=1, help="Read at most N source records")]
+SampleOpt = Annotated[int | None, typer.Option("--sample", min=1, help="Seeded sample of N eligible records")]
+SeedOpt = Annotated[int, typer.Option("--seed", help="Sampling seed")]
+HoldoutOpt = Annotated[int, typer.Option("--holdout", min=0, help="Seeded hold-out of N records, never stored")]
+LeakOpt = Annotated[bool, typer.Option("--allow-holdout-leak", help="Store even if hold-out ids are already in the corpus")]
+ConcordanceOpt = Annotated[bool, typer.Option("--concordance/--no-concordance",
+                                              help="Apply the WIPO concordance from data/source/ when present")]
+DataDirOpt = Annotated[Path | None, typer.Option("--data-dir", help="HUPD tarball directory (default HUPD_DATA_DIR)")]
+EditionOpt = Annotated[str | None, typer.Option("--label-ipc-edition", help="IPC edition of the source labels, e.g. 2017.01")]
+DescriptionOpt = Annotated[str | None, typer.Option("--description")]
+IngestBatchOpt = Annotated[int, typer.Option("--ingest-batch", min=1, help="Documents per committed ingest batch")]
+BatchOpt = Annotated[int, typer.Option("--batch", min=1, help="Documents per committed embedding batch")]
+FromNpyOpt = Annotated[Path | None, typer.Option("--from-npy", help="Directory of precomputed PaECTER .npy shards + meta.json")]
+IdsOpt = Annotated[Path | None, typer.Option("--ids", help="Id list for --from-npy (JSONL with title/abstract: text-checked)")]
+ModelPathOpt = Annotated[Path | None, typer.Option("--model-path", help="Local PaECTER copy (default PATENT_ENCODER_LOCAL_PATH)")]
+MOpt = Annotated[int, typer.Option("--m", help="HNSW m (required: measure it for the corpus, TASK-0007)")]
+EfcOpt = Annotated[int, typer.Option("--ef-construction", help="HNSW ef_construction (required, TASK-0007)")]
+MwmOpt = Annotated[str | None, typer.Option("--maintenance-work-mem", help="e.g. 2GB, this session only")]
+ProbesOpt = Annotated[int, typer.Option("--probes", min=1, help="Recall probes")]
+RecallOpt = Annotated[float, typer.Option("--min-recall", min=0.0, max=1.0, help="Minimum mean recall@k")]
+KOpt = Annotated[int | None, typer.Option("--k", min=1, help="Neighbours per probe (default NEIGHBOUR_K)")]
+
+
+@app.command("ingest-patents")
+def ingest_patents(
+    source: SourceOpt,
+    corpus: CorpusOpt,
+    years: YearsOpt,
+    limit: LimitOpt = None,
+    sample: SampleOpt = None,
+    seed: SeedOpt = DEFAULT_PATENT_SEED,
+    holdout: HoldoutOpt = 0,
+    allow_holdout_leak: LeakOpt = False,
+    concordance: ConcordanceOpt = True,
+    data_dir: DataDirOpt = None,
+    label_ipc_edition: EditionOpt = None,
+    description: DescriptionOpt = None,
+    ingest_batch: IngestBatchOpt = 2_000,
+) -> None:
+    """Load labelled patents from a source into a corpus (state loading). Manifest: data/manifests/patents/."""
+    _check_source(source)
+    year_list = _parse_years(years)
+    if source == "uspto-odp":
+        typer.echo(USPTO_UNVERIFIED_WARNING, err=True)
+    with _patent_errors_reported(), _patent_job(corpus) as conn:
+        result = _ingest_step(conn, corpus, source=source, years=year_list, limit=limit, sample=sample, seed=seed,
+                              holdout=holdout, allow_holdout_leak=allow_holdout_leak, concordance=concordance,
+                              data_dir=data_dir, label_ipc_edition=label_ipc_edition, description=description,
+                              batch=ingest_batch)  # fmt: skip
+    _echo({k: v for k, v in result.items() if k != "holdout_ids"} | {"holdout_ids": len(result.get("holdout_ids", []))})
+
+
+@app.command("embed-patents")
+def embed_patents(
+    corpus: CorpusOpt,
+    batch: BatchOpt = 1_000,
+    from_npy: FromNpyOpt = None,
+    ids: IdsOpt = None,
+    model_path: ModelPathOpt = None,
+) -> None:
+    """Fill the corpus's vectors (resumable): import precomputed shards if given, embed the rest with PaECTER."""
+    with _patent_errors_reported(), _patent_job(corpus) as conn:
+        result = _embed_step(conn, corpus, batch=batch, from_npy=from_npy, ids=ids, model_path=model_path)
+    _echo(result)
+    if result["state"] != "embedded":
+        _fail(f"corpus {corpus!r} is {result['state']!r}: {result['embedded']} of {result['documents']} documents "
+              "have a vector; re-run to continue")  # fmt: skip
+
+
+@app.command("build-patent-index")
+def build_patent_index_cmd(
+    corpus: CorpusOpt,
+    m: MOpt,
+    ef_construction: EfcOpt,
+    maintenance_work_mem: MwmOpt = None,
+    replace: Annotated[bool, typer.Option("--replace", help="Rebuild an existing valid index")] = False,
+    concurrently: Annotated[bool, typer.Option("--concurrently", help="CREATE INDEX CONCURRENTLY")] = False,
+) -> None:
+    """Build the corpus's partial HNSW index (refused while the corpus is serving)."""
+    with _patent_errors_reported(), _patent_job(corpus) as conn:
+        _echo(_index_step(conn, corpus, m=m, ef_construction=ef_construction,
+                          maintenance_work_mem=maintenance_work_mem, replace=replace, concurrently=concurrently))
+
+
+@app.command("validate-patent-corpus")
+def validate_patent_corpus(
+    corpus: CorpusOpt,
+    probes: ProbesOpt = 200,
+    min_recall: RecallOpt = 0.95,
+    k: KOpt = None,
+) -> None:
+    """Measure recall@k of the HNSW search against exact search; mark the corpus validated if it passes."""
+    with _patent_errors_reported(), _patent_job(corpus) as conn:
+        result = _validate_step(conn, corpus, probes=probes, min_recall=min_recall, k=k)
+    _echo(result)
+    if not result.get("passed"):
+        _fail(f"corpus {corpus!r} failed validation: " + "; ".join(result.get("reasons", [])))
+
+
+@app.command("activate-patent-corpus")
+def activate_patent_corpus(corpus: CorpusOpt) -> None:
+    """Serve a validated corpus with a usable index (any other corpus stops serving). No API restart needed."""
+    from app.services.patents.index import activate_corpus
+
+    with _patent_errors_reported(), _patent_job(corpus, serving_change=True) as conn:
+        c = activate_corpus(conn, corpus)
+    out = {"corpus_id": c.corpus_id, "is_serving": c.is_serving, "state": c.state, "document_count": c.document_count,
+           "served_at": c.served_at,
+           "note": "The API reads the serving corpus per request. Run POST /v1/admin/reload-confidence so the "
+                   "confidence fingerprint names this corpus."}  # fmt: skip
+    _write_patent_manifest("activate", corpus, out)
+    _echo(out)
+
+
+@app.command("retire-patent-corpus")
+def retire_patent_corpus(
+    corpus: CorpusOpt,
+    stop_serving: Annotated[bool, typer.Option("--stop-serving", help="Also stop serving it (vote falls back)")] = False,
+) -> None:
+    """Drop the corpus's index and set it back to embedded."""
+    from app.services.patents.index import retire_corpus
+
+    with _patent_errors_reported(), _patent_job(corpus, serving_change=True) as conn:
+        out = retire_corpus(conn, corpus, stop_serving=stop_serving)
+    _write_patent_manifest("retire", corpus, out)
+    _echo(out)
+
+
+@app.command("load-patents")
+def load_patents(
+    source: SourceOpt,
+    corpus: CorpusOpt,
+    years: YearsOpt,
+    m: MOpt,
+    ef_construction: EfcOpt,
+    limit: LimitOpt = None,
+    sample: SampleOpt = None,
+    seed: SeedOpt = DEFAULT_PATENT_SEED,
+    holdout: HoldoutOpt = 0,
+    allow_holdout_leak: LeakOpt = False,
+    concordance: ConcordanceOpt = True,
+    data_dir: DataDirOpt = None,
+    label_ipc_edition: EditionOpt = None,
+    description: DescriptionOpt = None,
+    ingest_batch: IngestBatchOpt = 2_000,
+    batch: BatchOpt = 1_000,
+    from_npy: FromNpyOpt = None,
+    ids: IdsOpt = None,
+    model_path: ModelPathOpt = None,
+    maintenance_work_mem: MwmOpt = None,
+    probes: ProbesOpt = 200,
+    min_recall: RecallOpt = 0.95,
+    reingest: Annotated[bool, typer.Option("--reingest", help="Run ingest even if a completed one can be skipped")] = False,
+) -> None:
+    """Ingest, embed, index and validate one corpus, in order; stop at the first failure. Re-run to resume.
+
+    Activation stays a separate, deliberate step (activate-patent-corpus). Each step writes its manifest under
+    data/manifests/patents/; the whole run holds the corpus's advisory lock.
+    """
+    _check_source(source)
+    year_list = _parse_years(years)
+    if (from_npy is None) != (ids is None):
+        raise typer.BadParameter("--from-npy and --ids go together (the shards and their id list)")
+    if source == "uspto-odp":
+        typer.echo(USPTO_UNVERIFIED_WARNING, err=True)
+    parameters = _ingest_parameters(source, year_list, limit, sample, seed, holdout, concordance)
+    steps: list[dict[str, Any]] = []
+    summary = {"corpus_id": corpus, "source": source, "years": year_list, "steps": steps}
+
+    def run(name: str, fn: Callable[[], dict], brief: Callable[[dict], dict]) -> dict:
+        t0 = time.perf_counter()
+        try:
+            result = fn()
+        except _patent_errors() as exc:
+            steps.append({"step": name, "status": "failed", "error": _describe(exc),
+                          "seconds": round(time.perf_counter() - t0, 1)})  # fmt: skip
+            _echo(summary)
+            _fail(f"load-patents stopped at step '{name}': {_describe(exc)}. Completed steps are kept; fix the cause "
+                  "and re-run the same command to resume.")  # fmt: skip
+        steps.append({"step": name, "status": "done", "seconds": round(time.perf_counter() - t0, 1), **brief(result)})
+        return result
+
+    with _patent_errors_reported(), _patent_job(corpus) as conn:
+        start = _corpus_row(conn, corpus)
+        if start is not None and start.state == "validated":
+            steps += [{"step": n, "status": "skipped", "why": "corpus is already validated"} for n in LOAD_STEPS]
+            summary["next"] = f"ipc activate-patent-corpus --corpus {corpus}"
+            _echo(summary)
+            return
+        skip_ingest = None if reingest else _ingest_done(conn, corpus, parameters)
+        if skip_ingest:
+            steps.append({"step": "ingest", "status": "skipped", "why": skip_ingest})
+        else:
+            run("ingest", lambda: _ingest_step(
+                conn, corpus, source=source, years=year_list, limit=limit, sample=sample, seed=seed, holdout=holdout,
+                allow_holdout_leak=allow_holdout_leak, concordance=concordance, data_dir=data_dir,
+                label_ipc_edition=label_ipc_edition, description=description, batch=ingest_batch),
+                lambda r: {"stored": r["counts"]["stored"], "corpus_document_count": r["corpus_document_count"],
+                           "concordance_applied": r["concordance_applied"]})  # fmt: skip
+        current = _corpus_row(conn, corpus)
+        if current is not None and current.state == "embedded":
+            steps.append({"step": "embed", "status": "skipped", "why": "corpus is embedded"})
+        else:
+            embedded = run("embed", lambda: _embed_step(conn, corpus, batch=batch, from_npy=from_npy, ids=ids,
+                                                        model_path=model_path),
+                           lambda r: {"documents": r["documents"], "embedded": r["embedded"], "state": r["state"]})
+            if embedded["state"] != "embedded":
+                steps[-1]["status"] = "failed"
+                _echo(summary)
+                _fail(f"load-patents stopped at step 'embed': {embedded['embedded']} of {embedded['documents']} "
+                      "documents have a vector (see the embed manifest). Re-run the same command to continue.")
+        run("index", lambda: _index_step(conn, corpus, m=m, ef_construction=ef_construction,
+                                         maintenance_work_mem=maintenance_work_mem),
+            lambda r: {"index_status": r["status"], "bytes": r.get("bytes")})
+        validated = run("validate", lambda: _validate_step(conn, corpus, probes=probes, min_recall=min_recall, k=None),
+                        lambda r: {"passed": r["passed"], "recall_at_k": r.get("recall_at_k"), "state": r["state"]})
+        if not validated["passed"]:
+            steps[-1]["status"] = "failed"
+            _echo(summary)
+            _fail("load-patents stopped at step 'validate': " + "; ".join(validated["reasons"])
+                  + ". Rebuild the index with larger --m / --ef-construction (build-patent-index --replace) or fix "
+                    "the load, then re-run.")  # fmt: skip
+    summary["next"] = f"ipc activate-patent-corpus --corpus {corpus}"
+    _write_patent_manifest("load", corpus, summary)
+    _echo(summary)
+
+
+@app.command("patent-status")
+def patent_status() -> None:
+    """List patent corpora: state, serving flag, document / embedding counts, encoder, index and its size."""
+    from app.db.patents import CORPUS_FIELDS, Corpus
+    from app.db.session import connect_direct
+    from app.services.patents.index import corpus_index
+
+    with _patent_errors_reported(), connect_direct() as conn:
+        if not conn.execute("SELECT to_regclass('public.patent_corpora') IS NOT NULL").fetchone()[0]:
+            conn.rollback()
+            _fail("the patent tables do not exist (run `ipc migrate`)")
+        corpora = [Corpus(*r) for r in conn.execute(
+            f"SELECT {CORPUS_FIELDS} FROM patent_corpora ORDER BY created_at, corpus_id").fetchall()]  # fixed fields
+        docs = dict(conn.execute("SELECT corpus_id, count(*) FROM patent_documents GROUP BY corpus_id").fetchall())
+        embs = dict(conn.execute("SELECT corpus_id, count(*) FROM patent_embeddings GROUP BY corpus_id").fetchall())
+        conn.rollback()
+        out = []
+        for c in corpora:
+            try:
+                index = corpus_index(conn, c.corpus_id)
+            except ValueError:  # an id that cannot have a partial index (should not exist)
+                index = None
+            out.append({
+                "corpus_id": c.corpus_id, "source": c.source, "state": c.state, "is_serving": c.is_serving,
+                "document_count": c.document_count, "documents": int(docs.get(c.corpus_id, 0)),
+                "embeddings": int(embs.get(c.corpus_id, 0)),
+                "encoder": {"model_id": c.encoder_model_id, "model_revision": c.encoder_model_revision},
+                "input_hash": c.input_hash, "label_ipc_edition": c.label_ipc_edition,
+                "labels_taxonomy_version": c.labels_taxonomy_version,
+                "index": None if index is None else {"name": index["index"], "bytes": index["bytes"],
+                                                     "mib": round(index["bytes"] / 2**20, 1), "valid": index["valid"]},
+                "created_at": c.created_at, "updated_at": c.updated_at, "served_at": c.served_at,
+            })  # fmt: skip
+    _echo({"target": get_settings().ipc_db_target, "corpora": out})
+
+
+def _load_pipeline():
+    """Load models + pipeline in-process (same code path as the API), on the definition path only.
+
+    Calibration pairs are reranker scores of definition-matched candidates. With NEIGHBOUR_VOTE_ENABLED the
+    pipeline would answer with vote codes instead, so the runtime is built ``definition_only``: the vote is off in
+    the pipeline and PaECTER is not loaded, while the fingerprint still describes the configured (served)
+    pipeline, so a fitted calibrator is compatible with the API that serves it.
+    """
+    from app.runtime import Runtime
+
+    rt = Runtime(get_settings(), definition_only=True)
     rt._load()  # synchronous for CLI use
     if rt.state != "ready":
         raise typer.Exit(f"model loading failed: {rt.error}")
