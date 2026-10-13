@@ -266,6 +266,20 @@ def _label_key(raw: Any, scheme: Scheme) -> Any:
     )
 
 
+def _within_catalogue(mapped: ResolvedLabel, catalogue: Catalogue) -> tuple[Outcome, ResolvedLabel | None]:
+    """A concordance result limited to ``catalogue``: the concordance filters against its *own* catalogue
+    (possibly none, or another release), and every label emitted here must exist in the caller's catalogue.
+
+    Levels absent from the catalogue are dropped; an exact code is kept only under a kept main group (never
+    deeper than a missing level). A mapped subclass that is not in the catalogue makes the label ``missing``.
+    """
+    if mapped.subclass not in catalogue:
+        return Outcome.MISSING, None
+    mg = mapped.main_group if mapped.main_group is not None and mapped.main_group in catalogue else None
+    exact = mapped.exact if mg is not None and mapped.exact is not None and mapped.exact in catalogue else None
+    return Outcome.CONCORDANCE, ResolvedLabel(mapped.subclass, mg, exact)
+
+
 def _printed_symbol(fields: StructuredFields) -> str | None:
     """A structured label as the printed symbol the concordance reads ("H01L 21/027", "H01L 21/00", "H01L")."""
     sec, cls, sub, mg, sg = fields
@@ -294,7 +308,9 @@ def resolve_labels(
     label once; labels that resolve to nothing are counted as ``missing`` and left out.
 
     With ``concordance``, a MISSING / SUBCLASS_ONLY / MAINGROUP_ONLY label is replaced by
-    ``concordance.resolve(raw)`` when that is not None, and counted as ``concordance`` instead.
+    ``concordance.resolve(raw)`` when that is not None, and counted as ``concordance`` instead. The mapped label is
+    cut to the levels present in ``catalogue``; if its subclass is absent, the label counts as ``missing`` and is
+    dropped (the fallback label too: the symbol is known to be abolished).
     """
     if scheme not in ("compact", "structured"):
         raise ValueError(f"unknown label scheme {scheme!r}; expected 'compact' or 'structured'")
@@ -316,7 +332,7 @@ def resolve_labels(
         if concordance is not None and outcome in REMAPPABLE and symbol is not None:
             mapped = concordance.resolve(symbol)
             if mapped is not None:
-                outcome, label = Outcome.CONCORDANCE, ResolvedLabel(*mapped)
+                outcome, label = _within_catalogue(ResolvedLabel(*mapped), catalogue)
         result.stats.count(outcome)
         if label is not None and label not in seen_labels:
             seen_labels.add(label)

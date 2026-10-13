@@ -49,6 +49,11 @@ DEFAULT_PROBES = 200
 DEFAULT_K = 100
 TIE_EPSILON = 1e-6  # an HNSW hit at the k-th exact distance (a tie) counts as found
 MAX_NAME = 63  # PostgreSQL identifier limit
+# Above this many vectors the planner must choose the HNSW index *unforced* (as a vote request runs the search);
+# below it a primary-key scan plus a sort is legitimately cheaper (gotcha: tiny test tables).
+DEFAULT_PLANNER_GATE_ROWS = 10_000
+# DROP INDEX waits at most this long for its lock, then fails cleanly instead of queueing vote searches behind it.
+DEFAULT_DROP_LOCK_TIMEOUT = "5s"
 
 
 class PatentIndexError(RuntimeError):
@@ -126,6 +131,25 @@ def corpus_index(conn: Connection, corpus_id: str) -> dict[str, Any] | None:
     return {"index": name, "bytes": int(size), "definition": indexdef, "valid": not problems, "problems": problems}
 
 
+def drop_index_statement(name: str) -> sql.Composed:
+    """``DROP INDEX CONCURRENTLY IF EXISTS``: a plain DROP INDEX takes an ACCESS EXCLUSIVE lock on all of
+    patent_embeddings, queues behind in-flight classify transactions and then blocks every new vote search.
+    CONCURRENTLY only waits for transactions using the index and never blocks readers; it needs autocommit."""
+    return sql.SQL("DROP INDEX CONCURRENTLY IF EXISTS {}").format(sql.Identifier(name))
+
+
+def _drop_index(conn: Connection, name: str, lock_timeout: str) -> None:
+    """Drop on an autocommit connection, waiting at most ``lock_timeout`` (then psycopg raises LockNotAvailable /
+    QueryCanceled and nothing is dropped)."""
+    if not conn.autocommit:
+        raise PatentIndexError("DROP INDEX CONCURRENTLY needs an autocommit connection")
+    conn.execute(sql.SQL("SET lock_timeout = {}").format(sql.Literal(lock_timeout)))
+    try:
+        conn.execute(drop_index_statement(name))
+    finally:
+        conn.execute("RESET lock_timeout")
+
+
 def _database_size(conn: Connection) -> int:
     size = conn.execute("SELECT pg_database_size(current_database())").fetchone()[0]
     return int(size)
@@ -153,48 +177,60 @@ def build_patent_index(
     concurrently: bool = False,
     replace: bool = False,
     lock_timeout: str = "60s",
+    drop_lock_timeout: str = DEFAULT_DROP_LOCK_TIMEOUT,
 ) -> dict[str, Any]:
     """Build the corpus's partial HNSW index and return the build manifest.
 
-    The corpus must be ``embedded`` (or ``validated``, to rebuild) and have vectors. An existing valid index is
-    kept (``status: "exists"``) unless ``replace``; an invalid one is dropped and rebuilt. ``maintenance_work_mem``
-    is set for this session only (sakthi's server default is 512 MB; ipc_user may SET it). ``concurrently``
-    avoids blocking writes to other corpora during the build, at the cost of a slower build. The manifest
-    records build seconds, index size and ``pg_database_size`` before and after.
+    The corpus must be ``embedded`` (or ``validated``, to rebuild) and have vectors, and must not be serving: a
+    rebuild drops the index every vote search depends on. An existing valid index is kept (``status:
+    "exists"``) unless ``replace``; an invalid one is dropped and rebuilt. A validated corpus whose index is
+    (re)built goes back to ``embedded`` *before* anything is dropped, so the new index must be validated again
+    and the corpus cannot be activated in between. Old indexes are dropped with ``DROP INDEX CONCURRENTLY``
+    (waiting at most ``drop_lock_timeout``). ``maintenance_work_mem`` is set for this session only (sakthi's
+    server default is 512 MB; ipc_user may SET it). ``concurrently`` avoids blocking writes to other corpora
+    during the build, at the cost of a slower build. The manifest records build seconds, index size and
+    ``pg_database_size`` before and after.
     """
     _check_corpus_id(corpus_id)
     if not 2 <= int(m) <= 100:
         raise ValueError("m must be in [2, 100] (pgvector)")
     if not 4 <= int(ef_construction) <= 1000 or int(ef_construction) < 2 * int(m):
         raise ValueError("ef_construction must be in [4, 1000] and >= 2 * m (pgvector)")
+    _require_idle(conn)
     corpus = _corpus(conn, corpus_id)
+    if corpus.is_serving:
+        raise CorpusStateError(f"corpus {corpus_id!r} is serving; its index cannot be built or replaced while vote "
+                               "searches use it (activate another corpus or retire it with stop_serving=True)")
     if corpus.state not in BUILDABLE_STATES:
         raise CorpusStateError(f"corpus {corpus_id!r} is {corpus.state!r}; build its index once it is embedded")
     name = index_name(corpus_id)
     manifest: dict[str, Any] = {
         "corpus_id": corpus_id, "index": name, "table": "patent_embeddings", "method": "hnsw",
         "opclass": "halfvec_cosine_ops", "m": int(m), "ef_construction": int(ef_construction),
-        "maintenance_work_mem": maintenance_work_mem, "concurrently": concurrently,
+        "maintenance_work_mem": maintenance_work_mem, "concurrently": concurrently, "state_before": corpus.state,
     }  # fmt: skip
+    existing = corpus_index(conn, corpus_id)
+    if existing is not None and existing["valid"] and not replace:
+        return {**manifest, "status": "exists", "bytes": existing["bytes"], "definition": existing["definition"],
+                "state": corpus.state}  # fmt: skip
+    if corpus.state == "validated":
+        # set_corpus_state refuses a serving corpus, so this also closes the race with a concurrent activation.
+        patents.set_corpus_state(conn, corpus_id, "embedded")
     with _autocommit(conn):
         manifest["server"] = _server_versions(conn)
         manifest["document_count"], manifest["embedding_count"] = _counts(conn, corpus_id)
         if manifest["embedding_count"] == 0:
             raise CorpusStateError(f"corpus {corpus_id!r} has no embeddings to index")
-        existing = corpus_index(conn, corpus_id)
-        if existing is not None and existing["valid"] and not replace:
-            return {**manifest, "status": "exists", "bytes": existing["bytes"], "definition": existing["definition"]}
         manifest["database_bytes_before"] = _database_size(conn)
-        conn.execute(sql.SQL("SET lock_timeout = {}").format(sql.Literal(lock_timeout)))
-        conn.execute("SET statement_timeout = 0")  # a large build takes far longer than any request timeout
-        if maintenance_work_mem:
-            conn.execute(sql.SQL("SET maintenance_work_mem = {}").format(sql.Literal(maintenance_work_mem)))
-        manifest["maintenance_work_mem_effective"] = conn.execute("SHOW maintenance_work_mem").fetchone()[0]
+        if existing is not None:
+            manifest["replaced"] = existing["definition"]
+            _drop_index(conn, name, drop_lock_timeout)
         try:
-            if existing is not None:
-                manifest["replaced"] = existing["definition"]
-                conn.execute(sql.SQL("DROP INDEX {conc} IF EXISTS {name}").format(
-                    conc=sql.SQL("CONCURRENTLY") if concurrently else sql.SQL(""), name=sql.Identifier(name)))
+            conn.execute(sql.SQL("SET lock_timeout = {}").format(sql.Literal(lock_timeout)))
+            conn.execute("SET statement_timeout = 0")  # a large build takes far longer than any request timeout
+            if maintenance_work_mem:
+                conn.execute(sql.SQL("SET maintenance_work_mem = {}").format(sql.Literal(maintenance_work_mem)))
+            manifest["maintenance_work_mem_effective"] = conn.execute("SHOW maintenance_work_mem").fetchone()[0]
             t0 = time.perf_counter()
             conn.execute(sql.SQL(
                 "CREATE INDEX {conc} {name} ON patent_embeddings USING hnsw (embedding halfvec_cosine_ops)"
@@ -214,6 +250,7 @@ def build_patent_index(
         manifest["definition"] = built["definition"]
         manifest["database_bytes_after"] = _database_size(conn)
     manifest["status"] = "created"
+    manifest["state"] = "embedded"  # a freshly built index is unmeasured: validate_corpus decides
     return manifest
 
 
@@ -234,6 +271,11 @@ def _force_hnsw(conn: Connection) -> None:
                  " set_config('enable_sort', 'off', true)")
 
 
+def _is_hit(n: Any, exact_ids: set[str], kth: float) -> bool:
+    """An HNSW result counts if exact search has it, or it ties the k-th exact distance."""
+    return n.document_id in exact_ids or (1.0 - n.similarity) <= kth + TIE_EPSILON
+
+
 def _exact_mode(conn: Connection) -> None:
     """Exact reference search (transaction-local): no index scans, so never the HNSW graph (pgvector's HNSW
     has no bitmap scan). The result is a full scan of the corpus's rows, sorted by distance."""
@@ -249,12 +291,20 @@ def validate_corpus(
     ef_search: int | None = None,
     threshold: float = DEFAULT_RECALL_THRESHOLD,
     seed: int = 20261013,
+    planner_gate_rows: int = DEFAULT_PLANNER_GATE_ROWS,
 ) -> dict[str, Any]:
     """Measure recall@k of the corpus's HNSW search against exact search, and mark it ``validated`` if it passes.
 
     Probes are ``probes`` corpus vectors chosen deterministically from ``seed``. For each, the real search
     (``patent_search.search_patents`` with ``ef_search``, default PATENT_HNSW_EF_SEARCH) is compared with an
     exact scan (index scans off) of the same corpus. An HNSW hit at the k-th exact distance counts (ties).
+    Each probe is itself a corpus vector at distance 0, which any search finds; ``recall_at_k`` counts only the
+    other neighbours (the probe's own document is left out on both sides) and is what the threshold gates.
+    ``recall_at_k_with_self`` is recorded too.
+
+    The recall is measured on a forced HNSW plan (a small corpus would otherwise be scanned exactly). Above
+    ``planner_gate_rows`` embeddings the planner must also choose the index *unforced*, as a vote request runs
+    the search; both plan checks are recorded.
 
     Passes when: the corpus's index exists and is valid, the planner uses it, every probe returned k rows,
     mean recall@k >= ``threshold``, the corpus has at least k documents, and document count == embedding count.
@@ -297,7 +347,8 @@ def validate_corpus(
     if doc_count < k:
         reasons.append(f"corpus has {doc_count} documents, fewer than k={k}: every vote would fall short")
 
-    recalls: list[float] = []
+    recalls: list[float] = []  # self-hit excluded (gated)
+    recalls_with_self: list[float] = []
     latencies: list[float] = []
     shortfalls = 0
     if index is not None and index["valid"] and emb_count >= k:
@@ -324,12 +375,18 @@ def validate_corpus(
             manifest["planner_default_uses_index"] = f"using {name}" in unforced
             manifest["plan_uses_index"] = f"using {name}" in plan
             manifest["exact_plan_avoids_index"] = name not in exact_plan
+            manifest["planner_gate_rows"] = planner_gate_rows
+            manifest["planner_gate_applied"] = emb_count > planner_gate_rows
+            if manifest["planner_gate_applied"] and not manifest["planner_default_uses_index"]:
+                reasons.append(f"with {emb_count} vectors (> {planner_gate_rows}) the planner does not choose the "
+                               "corpus index for the unforced search statement, so vote searches would scan:\n"
+                               + unforced)  # fmt: skip
             if not manifest["plan_uses_index"]:
                 reasons.append("the planner cannot use the corpus index for the search statement:\n" + plan)
             if not manifest["exact_plan_avoids_index"]:
                 reasons.append("the exact reference search still used the HNSW index:\n" + exact_plan)
         measurable = bool(rows) and manifest["plan_uses_index"] and manifest["exact_plan_avoids_index"]
-        for _doc_id, vector_text in rows if measurable else []:
+        for probe_id, vector_text in rows if measurable else []:
             vec = _vector(vector_text)
             _exact_mode(conn)
             exact = conn.execute(
@@ -352,11 +409,16 @@ def validate_corpus(
                 latencies.append((time.perf_counter() - t) * 1000)
             finally:
                 conn.rollback()
-            hits = sum(1 for n in found if n.document_id in exact_ids or (1.0 - n.similarity) <= kth + TIE_EPSILON)
-            recalls.append(min(1.0, hits / k))
+            hits = [_is_hit(n, exact_ids, kth) for n in found]
+            recalls_with_self.append(min(1.0, sum(hits) / k))
+            # Without the probe's own document (distance 0, found by any search): the k-1 real neighbours.
+            wanted = len(exact_ids - {probe_id}) or 1
+            others = sum(h for n, h in zip(found, hits, strict=True) if n.document_id != probe_id)
+            recalls.append(min(1.0, others / wanted))
 
     if recalls:
         manifest["recall_at_k"] = round(statistics.fmean(recalls), 4)
+        manifest["recall_at_k_with_self"] = round(statistics.fmean(recalls_with_self), 4)
         manifest["recall_at_k_min"] = round(min(recalls), 4)
         manifest["probes_below_threshold"] = sum(1 for r in recalls if r < threshold)
         manifest["hnsw_ms_p50"] = round(statistics.median(latencies), 2)
@@ -393,11 +455,13 @@ def activate_corpus(conn: Connection, corpus_id: str) -> Corpus:
     return patents.set_serving_corpus(conn, corpus_id)
 
 
-def retire_corpus(conn: Connection, corpus_id: str, *, stop_serving: bool = False) -> dict[str, Any]:
+def retire_corpus(conn: Connection, corpus_id: str, *, stop_serving: bool = False,
+                  drop_lock_timeout: str = DEFAULT_DROP_LOCK_TIMEOUT) -> dict[str, Any]:  # fmt: skip
     """Drop the corpus's index and set it back to ``embedded`` (it must be re-indexed and re-validated to serve).
 
     A serving corpus is refused unless ``stop_serving``: then serving stops first and the classifier falls back
-    to definition matching until another corpus is activated.
+    to definition matching until another corpus is activated. The state goes to ``embedded`` before the drop (no
+    activation in between), and the drop is ``DROP INDEX CONCURRENTLY`` waiting at most ``drop_lock_timeout``.
     """
     _check_corpus_id(corpus_id)
     _require_idle(conn)
@@ -408,11 +472,11 @@ def retire_corpus(conn: Connection, corpus_id: str, *, stop_serving: bool = Fals
         if not stop_serving:
             raise CorpusStateError(f"corpus {corpus_id!r} is serving; pass stop_serving=True to retire it")
         patents.unset_serving_corpus(conn)
-    with _autocommit(conn):
-        out["dropped"] = corpus_index(conn, corpus_id) is not None
-        conn.execute(sql.SQL("DROP INDEX IF EXISTS {}").format(sql.Identifier(index_name(corpus_id))))
     if corpus.state == "validated":
         out["state"] = patents.set_corpus_state(conn, corpus_id, "embedded").state
     else:
         out["state"] = corpus.state
+    with _autocommit(conn):
+        out["dropped"] = corpus_index(conn, corpus_id) is not None
+        _drop_index(conn, index_name(corpus_id), drop_lock_timeout)
     return out

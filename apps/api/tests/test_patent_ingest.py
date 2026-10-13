@@ -107,6 +107,9 @@ class FakeRepo:
     def document_count(self, corpus_id: str) -> int:
         return len(self.documents[corpus_id])
 
+    def existing_ids(self, corpus_id: str, document_ids: list[str]) -> set[str]:
+        return set(document_ids) & set(self.documents[corpus_id])
+
 
 def _ids(repo: FakeRepo, corpus_id: str = "c1") -> set[str]:
     return set(repo.documents[corpus_id])
@@ -150,7 +153,7 @@ def test_sampling_is_deterministic_and_the_holdout_is_disjoint() -> None:
     assert len(ids1) == 50 and len(m1["holdout_ids"]) == 20
     assert not ids1 & set(m1["holdout_ids"])  # hold-out never enters the corpus
     assert m1["counts"] == {"read": 200, "no_usable_label": 0, "pool": 200, "held_out": 20, "not_sampled": 130,
-                            "selected": 50, "unresolvable": 0, "stored": 50}  # fmt: skip
+                            "selected": 50, "holdout_duplicate": 0, "unresolvable": 0, "stored": 50}  # fmt: skip
     # exactly the documents prepare_corpus.py would pick
     pool = list(records)
     random.Random(7).shuffle(pool)
@@ -209,13 +212,14 @@ def test_unresolvable_and_unusable_documents_are_skipped_and_counted() -> None:
     m = ingest(FakeReader(records), "c1", CATALOGUE, seed=1, repository=repo)
     assert _ids(repo) == {"15000000"}
     assert m["counts"] == {"read": 4, "no_usable_label": 1, "pool": 3, "held_out": 0, "not_sampled": 0,
-                           "selected": 3, "unresolvable": 2, "stored": 1}  # fmt: skip
+                           "selected": 3, "holdout_duplicate": 0, "unresolvable": 2, "stored": 1}  # fmt: skip
     assert m["label_resolution"]["missing"] == 3
 
 
 def test_concordance_is_applied_and_counted() -> None:
     class Conc:
         sources = ("wipo_ipc_concordance_20260101.zip",)
+        catalogue = CATALOGUE
 
         def resolve(self, code: str) -> ResolvedLabel | None:
             return ResolvedLabel("G06F", "G06F 16/00", None) if code == "H01L21027" else None
@@ -228,6 +232,47 @@ def test_concordance_is_applied_and_counted() -> None:
     assert repo.documents["c1"]["15000001"].resolved_labels == [("G06F", "G06F 16/00", None)]
     assert m["label_resolution"]["concordance"] == 1 and m["counts"]["unresolvable"] == 0
     assert m["concordance"] == {"sources": ["wipo_ipc_concordance_20260101.zip"]}
+
+
+def test_a_concordance_without_a_catalogue_is_refused() -> None:
+    class NoCatalogue:
+        catalogue = None
+
+        def resolve(self, code: str) -> ResolvedLabel | None:
+            return None
+
+    repo = FakeRepo()
+    with pytest.raises(IngestError, match="no catalogue"):
+        ingest(FakeReader([_record(1)]), "c1", CATALOGUE, seed=1, concordance=NoCatalogue(), repository=repo)
+    assert repo.corpora == {}  # refused before anything was created
+
+
+def test_holdout_ids_left_in_the_corpus_by_an_earlier_run_fail_the_load() -> None:
+    records = [_record(i) for i in range(200)]
+    repo = FakeRepo()
+    first = ingest(FakeReader(records), "c1", CATALOGUE, seed=7, sample_size=50, holdout_size=20, repository=repo)
+    assert first["holdout_leak"] == []
+    # another seed: some of its hold-out ids were stored by the first run
+    with pytest.raises(ing.HoldoutLeak) as exc:
+        ingest(FakeReader(records), "c1", CATALOGUE, seed=8, sample_size=50, holdout_size=20, repository=repo)
+    leak = exc.value.manifest["holdout_leak"]
+    assert leak and set(leak) <= set(exc.value.manifest["holdout_ids"]) and set(leak) <= _ids(repo)
+    assert "hold-out id(s) are in corpus 'c1'" in str(exc.value)
+    allowed = ingest(FakeReader(records), "c1", CATALOGUE, seed=8, sample_size=50, holdout_size=20, repository=repo,
+                     allow_holdout_leak=True)  # fmt: skip
+    assert allowed["holdout_leak"] == leak
+
+
+def test_a_duplicate_id_in_hold_out_and_corpus_positions_is_not_stored() -> None:
+    n = 40
+    holdout_pos, corpus_pos = split_sample(n, seed=5, holdout_size=4, sample_size=10)
+    records = [_record(i) for i in range(n)]
+    # the same document id at a hold-out position and at a corpus position (a duplicate in the source)
+    records[corpus_pos[0]] = replace(records[corpus_pos[0]], document_id=records[holdout_pos[0]].document_id)
+    repo = FakeRepo()
+    m = ingest(FakeReader(records), "c1", CATALOGUE, seed=5, sample_size=10, holdout_size=4, repository=repo)
+    assert m["counts"]["holdout_duplicate"] == 1 and m["counts"]["stored"] == 9
+    assert m["holdout_leak"] == [] and not _ids(repo) & set(m["holdout_ids"])
 
 
 def test_corpus_spec_and_state_rules() -> None:
@@ -367,7 +412,7 @@ def test_ingest_the_hupd_fixture_end_to_end(db_conn) -> None:
                label_ipc_edition="2017.01", source_parameters={"paths": [HUPD_SAMPLE.name]})  # fmt: skip
     print("\nmanifest:", m)
     assert m["counts"] == {"read": 2, "no_usable_label": 0, "pool": 2, "held_out": 0, "not_sampled": 0,
-                           "selected": 2, "unresolvable": 0, "stored": 2}  # fmt: skip
+                           "selected": 2, "holdout_duplicate": 0, "unresolvable": 0, "stored": 2}  # fmt: skip
     assert m["reader_stats"] == {"read": 3, "yielded": 2, "skipped": 1, "skipped_reasons": {"short_abstract": 1}}
     corpus = patents.get_corpus(conn, corpus_id)
     docs = patents.fetch_documents(conn, corpus_id, ["15900001", "15900002"])
@@ -389,3 +434,9 @@ def test_ingest_the_hupd_fixture_end_to_end(db_conn) -> None:
     stored = set(patents.fetch_documents(conn, held_id, ["15900001", "15900002"]))
     conn.rollback()
     assert len(h["holdout_ids"]) == 1 and stored == {"15900001", "15900002"} - set(h["holdout_ids"])
+    assert h["holdout_leak"] == []
+
+    # B1: the first corpus already holds both documents, so a hold-out drawn into it leaks and fails the load
+    with pytest.raises(ing.HoldoutLeak) as exc:
+        ingest(HupdReader([HUPD_SAMPLE]), corpus_id, catalogue, seed=20261013, holdout_size=1, repository=conn)
+    assert exc.value.manifest["holdout_leak"] == h["holdout_ids"]
