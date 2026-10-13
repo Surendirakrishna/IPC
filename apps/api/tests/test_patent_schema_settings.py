@@ -2,8 +2,10 @@
 
 Unit tests need no database. Integration tests run against the local docker database:
     IPC_DB_TARGET=local uv run pytest -m integration tests/test_patent_schema_settings.py
-(after `uv run ipc --target local migrate`). They only touch rows whose corpus id starts with
-"it-test-" and delete them afterwards.
+(after `uv run ipc --target local migrate`), or against sakthi only with an explicit opt-in:
+    IPC_DB_TARGET=sakthi IPC_INTEGRATION_ALLOW_SAKTHI=1 uv run pytest -m integration tests/test_patent_schema_settings.py
+They only touch the patent tables, only rows whose corpus id starts with "it-test-", delete them
+afterwards, and refuse to run if a non-test corpus is serving.
 """
 
 from __future__ import annotations
@@ -266,31 +268,61 @@ def test_batches_and_vector_checks() -> None:
         patents._labels_json([("H04L", None)])
 
 
-# --- integration: local docker database ------------------------------------------------------------------
+# --- integration: local docker database, or sakthi with an explicit opt-in ----------------------------------
+#
+# These tests write only to the patent tables (patent_corpora / patent_documents / patent_embeddings) and
+# only rows whose corpus id starts with TEST_PREFIX. On sakthi (the live database) they run only with
+# IPC_DB_TARGET=sakthi AND IPC_INTEGRATION_ALLOW_SAKTHI=1 (user decision 2026-10-13).
+
+TEST_PREFIX = "it-test-"
+
+
+def _integration_target() -> str | None:
+    target = os.environ.get("IPC_DB_TARGET")
+    if target == "local":
+        return target
+    if target == "sakthi" and os.environ.get("IPC_INTEGRATION_ALLOW_SAKTHI") == "1":
+        return target
+    return None
 
 
 @pytest.fixture
 def db_conn():
-    if os.environ.get("IPC_DB_TARGET") != "local":
-        pytest.skip("set IPC_DB_TARGET=local to run DB integration tests")
+    target = _integration_target()
+    if target is None:
+        pytest.skip("set IPC_DB_TARGET=local (or IPC_DB_TARGET=sakthi with IPC_INTEGRATION_ALLOW_SAKTHI=1) "
+                    "to run DB integration tests")
     from app.config import get_settings
 
     get_settings.cache_clear()
+    assert get_settings().ipc_db_target == target
     from app.db.session import connect_direct
 
     conn = connect_direct()
     row = conn.execute("SELECT corpus_id FROM patent_corpora WHERE is_serving").fetchone()
     previous_serving = row[0] if row else None
     conn.commit()
+    # Serving a test corpus un-serves whatever serves now. Refuse outright if that is a real corpus:
+    # no corpus outside the it-test- namespace may be modified.
+    if previous_serving is not None and not previous_serving.startswith(TEST_PREFIX):
+        conn.close()
+        pytest.fail(f"refusing to run: corpus {previous_serving!r} is serving and the tests would un-serve it")
     created: list[str] = []
     try:
         yield conn, created
     finally:
-        # Runs even if the test fails midway: remove test corpora, then give serving back to whichever
-        # corpus served before the test, so a failure cannot leave nothing serving.
+        # Runs even if the test fails midway: remove this test's corpora (it-test-* only), then give
+        # serving back to whichever corpus served before, so a failure cannot leave nothing serving.
+        assert all(c.startswith(TEST_PREFIX) for c in created), created
         conn.rollback()
-        conn.execute("UPDATE patent_corpora SET is_serving = false WHERE corpus_id = ANY(%s)", [created])
-        conn.execute("DELETE FROM patent_corpora WHERE corpus_id = ANY(%s)", [created])
+        conn.execute(
+            "UPDATE patent_corpora SET is_serving = false WHERE corpus_id = ANY(%s) AND corpus_id LIKE %s",
+            [created, TEST_PREFIX + "%"],
+        )
+        conn.execute(
+            "DELETE FROM patent_corpora WHERE corpus_id = ANY(%s) AND corpus_id LIKE %s",
+            [created, TEST_PREFIX + "%"],
+        )
         if previous_serving is not None:
             conn.execute(
                 "UPDATE patent_corpora SET is_serving = true, updated_at = now()"
@@ -303,11 +335,12 @@ def db_conn():
 
 
 def _spec(created: list[str], **overrides: object) -> CorpusSpec:
-    corpus_id = f"it-test-{uuid.uuid4().hex[:10]}"
+    corpus_id = f"{TEST_PREFIX}{uuid.uuid4().hex[:10]}"
     created.append(corpus_id)
     fields = {"corpus_id": corpus_id, "source": "hupd", "label_scheme": "compact",
               "encoder_model_id": "mpi-inno-comp/paecter", "encoder_model_revision": "rev-1"}
     fields.update(overrides)
+    assert str(fields["corpus_id"]).startswith(TEST_PREFIX), fields["corpus_id"]
     return CorpusSpec(**fields)  # type: ignore[arg-type]
 
 
