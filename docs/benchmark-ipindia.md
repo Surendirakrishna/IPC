@@ -21,7 +21,7 @@ answers 97.6% of the time. Its first code matches a recorded IPC symbol at:
 
 A recorded symbol is among the first 100 candidates for 78.0% (subclass), 59.3% (main group) and
 **44.7% (exact)** of applications. The previous pipeline managed 71.5%, 48.0% and 26.8%. Its field of
-invention matches the office's label 40.8% (32.6–49.6) of the time.
+invention matches the office's label 41.5% (33.1–50.3) of the time (51 of 123).
 
 The top-1 gains over the previous pipeline (28.5% / 17.1% / 8.1%) are within the confidence
 intervals. The candidate-recall gains are not. Policy v1 abstained on 87.8% of the same documents.
@@ -103,8 +103,8 @@ Runs: `data/manifests/benchmarks/wipo2026_test__*`. Scored with `_score_docs`; l
 
 | Abstract-only | Abstains | Subclass top-1 | Main-group top-1 | Exact top-1 | Field label | Median s |
 | --- | --- | --- | --- | --- | --- | --- |
-| Previous pipeline (v2) | 1.6% | 28.5% (21.2–37.0) | 17.1% (11.4–24.7) | 8.1% (4.5–14.3) | 41.6% | 7.4 |
-| **After rebuild** | 2.4% | **30.9% (23.4–39.5)** | **17.9% (12.1–25.6)** | **8.9% (5.1–15.3)** | 40.8% | 9.5 |
+| Previous pipeline (v2) | 1.6% | 28.5% (21.2–37.0) | 17.1% (11.4–24.7) | 8.1% (4.5–14.3) | 42.3% | 7.4 |
+| **After rebuild** | 2.4% | **30.9% (23.4–39.5)** | **17.9% (12.1–25.6)** | **8.9% (5.1–15.3)** | 41.5% | 9.5 |
 
 | Recorded symbol among the first *k* candidates | Subclass | Main group | Exact |
 | --- | --- | --- | --- |
@@ -218,7 +218,7 @@ Runs: `data/manifests/benchmarks/neighbour_v1__{dev,test}_abstract/` (`report.js
 
 | Held-out test, 123 applications | Subclass top-1 | Main-group top-1 | Exact top-1 | Field label | Median s |
 | --- | --- | --- | --- | --- | --- |
-| Definition matching (after rebuild) | 30.9% (23.4–39.5) | 17.9% (12.1–25.6) | 8.9% (5.1–15.3) | 40.8% | 9.5 |
+| Definition matching (after rebuild) | 30.9% (23.4–39.5) | 17.9% (12.1–25.6) | 8.9% (5.1–15.3) | 41.5% (33.1–50.3) | 9.5 |
 | kNN vote, PaECTER, offline (exact search) | 65.9% (57.1–73.6) | 48.0% (39.3–56.7) | 31.7% (24.1–40.4) | – | – |
 | **Neighbour vote, served** | **63.4% (54.6–71.4)** | **44.7% (36.2–53.5)** | **30.1% (22.7–38.7)** | **56.1% (47.3–64.6)** | **1.6** |
 
@@ -231,17 +231,24 @@ Runs: `data/manifests/benchmarks/neighbour_v1__{dev,test}_abstract/` (`report.js
   definition fallback (`202531030525`, a vote below the 0.2 minimum). Dev: all 130 from the vote. No
   document abstained. These counts are inferred from `retrieval_debug`, see the known gap below.
 - **Served against offline.** The served vote is 2–4 documents per level behind offline on test
-  (78 / 55 / 37 against 81 / 59 / 39 of 123), well inside the intervals. Search is not the only difference: the served corpus is 26 documents smaller
-  (no resolvable label), and its labels went through the WIPO concordance, so H01L patents now vote for
-  H10 codes, which they could not offline.
-- **Recorded symbol among the returned codes** (test): subclass 78.0% within the first 3 and within 5;
-  main group 57.7% / 60.2%; exact 40.7% / 42.3%. Only the codes the API returned count here: at most 5,
-  each with at least 0.2 vote share. That is a stricter measure than the offline hit@3 above, which
-  used the whole vote ranking.
-- **Do not compare hit@10 or hit@100.** For a vote response the benchmark's ranked list holds only the
-  returned codes (5 or fewer), so the vote's hit@10 and hit@100 in `report.json` equal its hit@5. The
-  definition path's hit@10 and hit@100 were measured over about 100 reranked candidates. Compare top-1,
-  and hit@3 / hit@5 only.
+  (78 / 55 / 37 against 81 / 59 / 39 of 123), well inside the intervals. Three things differ from the
+  offline run (the vectors do not: they were imported from the same fp16 PaECTER run):
+  1. **Search:** approximate HNSW search (recall@100 0.9884 against exact search) instead of exact search.
+  2. **Corpus:** 26 fewer documents (no resolvable label), and labels resolved through the WIPO
+     concordance (148,239 labels remapped), so H01L patents now vote for H10 codes, which they could
+     not offline.
+  3. **The 0.2 gate:** test document `202531030525` was answered by the definition fallback. Offline
+     had no gate.
+- **Recorded symbol among the first 3 / 5 codes** (test): subclass 78.0% / 78.0%; main group 57.7% /
+  60.2%; exact 40.7% / 42.3%. For a vote response these count only the returned candidates (at most
+  5), in vote order before any rule demotion. That is a stricter measure than the offline hit@3 above,
+  which used the whole vote ranking.
+- **Do not compare hit@10 or hit@100.** For a vote response the benchmark's ranked list holds the
+  returned candidates plus the alternatives over the `max_results` ceiling: at most 10 codes, and every
+  code after the first has at least 0.2 share at its own level (the first code is gated only on its
+  subclass share). So the vote's hit@100 equals its hit@10, and hit@10 can exceed hit@5 (dev subclass
+  80.8% against 80.0%). The definition path's hit@10 and hit@100 were measured over about 100 reranked
+  candidates. Compare top-1, and hit@3 / hit@5 only.
 - **QKD example (live):** H04L 9/08 "Key distribution" at 87.9% vote share, then H04L 9/14 (34.1%)
   and H04L 9/32 (22.1%). H04B 10/70 (16.1%) is below the minimum share and is not listed.
 - **Known gap: benchmark provenance.** `ipc benchmark` still records only the definition path's
@@ -258,7 +265,7 @@ Runs: `data/manifests/benchmarks/neighbour_v1__{dev,test}_abstract/` (`report.js
 | Variant | Abstains | Subclass top-1 | Main-group top-1 | Exact top-1 | Subclass, any returned code | Field label |
 | --- | --- | --- | --- | --- | --- | --- |
 | v1 policy (replayed on the same rankings) | 87.8% | 7.3% (3.9–13.3) | 2.4% (0.8–6.9) | 1.6% (0.4–5.7) | 7.3% | 0% |
-| **v2 policy (live API)** | **1.6%** | **28.5% (21.2–37.0)** | **17.1% (11.4–24.7)** | **8.1% (4.5–14.3)** | **35.0%** | **41.6% (33.3–50.4)** |
+| **v2 policy (live API)** | **1.6%** | **28.5% (21.2–37.0)** | **17.1% (11.4–24.7)** | **8.1% (4.5–14.3)** | **35.0%** | **42.3% (33.9–51.1)** |
 | Baseline: always the top-ranked candidate | 0% | 28.5% | 16.3% | 6.5% | 28.5% | – |
 | Baseline: always the top 3 | 0% | 28.5% | 16.3% | 6.5% | 49.6% | – |
 
@@ -278,8 +285,8 @@ behave as abstract-only. The policy settings are the abstract-tuned v2 values.
 
 | Variant (all 123 scorable) | Abstains | Subclass top-1 | Main-group top-1 | Exact top-1 | Field label | Median time per document |
 | --- | --- | --- | --- | --- | --- | --- |
-| Abstract-only, v2 | 1.6% | 28.5% | 17.1% | 8.1% | 41.6% | 7.4 s |
-| Abstract + claims, v2 | 0.8% | 27.6% (20.5–36.1) | 10.6% (6.3–17.2) | 2.4% (0.8–6.9) | 37.6% | 15.2 s |
+| Abstract-only, v2 | 1.6% | 28.5% | 17.1% | 8.1% | 42.3% | 7.4 s |
+| Abstract + claims, v2 | 0.8% | 27.6% (20.5–36.1) | 10.6% (6.3–17.2) | 2.4% (0.8–6.9) | 38.2% | 15.2 s |
 
 Restricted to the 72 applications that have claims:
 
@@ -311,7 +318,7 @@ classification. Claims stay useful as evidence text for review.
   - Recorded codes are applicant-declared, often broad and sometimes from old IPC editions.
   - Abstracts alone often omit the defining feature of the recorded subgroup.
   - The catalogue's `semantic_text` is dominated by long ancestor headings.
-- **Field labels.** Field agreement went from 0% to 41.6%. The most frequent confusions are
+- **Field labels.** Field agreement went from 0% to 42.3%. The most frequent confusions are
   ELECTRONICS ↔ COMPUTER SCIENCE / MECHANICAL ENGINEERING and MECHANICAL ↔ BIO-MEDICAL. These
   categories genuinely overlap, and the office's label is chosen by the applicant.
 - **QKD contract example.** The example now returns H04W 12/0433 "Key management protocols", with a

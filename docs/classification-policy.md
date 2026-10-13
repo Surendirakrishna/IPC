@@ -88,6 +88,9 @@ Also:
   by matching the precedence wording "(X takes precedence" in the demotion reason, which a place rule
   doesn't have. The next code in vote order leads instead. In the QKD example, H04L 9/08 carries
   "WIPO place rule (not applied)" notes naming the last-place rule for H04L 9/06–9/32.
+  **Don't enable `APPLY_PLACE_RULES` together with the vote** until that combination has been checked:
+  on the QKD example the last-place rule would demote H04L 9/08 (87.9%) and H04L 9/14 and put
+  H04L 9/32 (22.1%) first (worked out from the rule logic in rules.py, not run).
 
 ## Definition pipeline (explanation and fallback)
 
