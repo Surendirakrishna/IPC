@@ -30,7 +30,8 @@ CATALOGUE = frozenset(
     }
 )
 
-CATALOGUE_FILE = Path(__file__).resolve().parents[3] / "data" / "source" / "ipc_classification_index.jsonl"
+SOURCE_DIR = Path(__file__).resolve().parents[3] / "data" / "source"
+CATALOGUE_FILE = SOURCE_DIR / "ipc_classification_index.jsonl"
 
 
 # --- resolve_compact: the gotcha-note samples ----------------------------------------------------
@@ -158,7 +159,7 @@ def test_resolve_labels_order_dedup_and_stats() -> None:
         ResolvedLabel("G06K", None, None),
     ]
     assert res.stats.as_dict() == {
-        "exact": 2, "maingroup_only": 1, "subclass_only": 1, "ambiguous": 1, "missing": 1,
+        "exact": 2, "maingroup_only": 1, "subclass_only": 1, "ambiguous": 1, "missing": 1, "concordance": 0,
     }
     assert res.stats.total == 6  # each distinct raw label counted once
 
@@ -193,7 +194,8 @@ def test_resolve_labels_structured_forms() -> None:
         ResolvedLabel("H04L", "H04L 12/00", "H04L 12/18"),
         ResolvedLabel("H04L", "H04L 1/00", "H04L 1/18"),
     ]
-    assert res.stats.as_dict() == {"exact": 3, "maingroup_only": 0, "subclass_only": 0, "ambiguous": 0, "missing": 2}
+    assert res.stats.as_dict() == {"exact": 3, "maingroup_only": 0, "subclass_only": 0, "ambiguous": 0, "missing": 2,
+                                   "concordance": 0}
 
 
 def test_resolve_labels_empty() -> None:
@@ -206,13 +208,72 @@ def test_resolve_labels_rejects_unknown_scheme() -> None:
         resolve_labels(["H04L1218"], "display", CATALOGUE)  # type: ignore[arg-type]
 
 
-def test_concordance_hook_is_reserved_for_task_0015() -> None:
-    class Identity:
-        def apply(self, code: str) -> list[str] | None:
-            return [code]
+# --- concordance (TASK-0015 wiring, TASK-0005) --------------------------------------------------------
 
-    with pytest.raises(NotImplementedError, match="TASK-0015"):
-        resolve_labels(["H01L2100"], "compact", CATALOGUE, concordance=Identity())
+
+class FakeConcordance:
+    """Records what it was asked; ``resolve`` answers from a table, ``apply`` must never be used."""
+
+    def __init__(self, table: dict[str, ResolvedLabel | None]) -> None:
+        self.table = table
+        self.asked: list[str] = []
+
+    def resolve(self, code: str) -> ResolvedLabel | None:
+        self.asked.append(code)
+        return self.table.get(code)
+
+    def apply(self, code: str) -> list[str] | None:
+        raise AssertionError("resolve_labels must not reduce apply() targets itself")
+
+
+def test_concordance_remaps_only_missing_subclass_only_and_maingroup_only() -> None:
+    conc = FakeConcordance({
+        "H01L21027": ResolvedLabel("H10B", "H10B 10/00", None),  # MISSING (H01L abolished)
+        "H04L2906": ResolvedLabel("H04L", "H04L 9/00", None),  # SUBCLASS_ONLY fallback
+        "B65D5199": ResolvedLabel("B65D", "B65D 51/00", "B65D 51/00"),  # MAINGROUP_ONLY fallback
+        "H04L1218": ResolvedLabel("G16H", None, None),  # EXACT: must not even be asked
+        "A61B5022": ResolvedLabel("G16H", None, None),  # AMBIGUOUS: must not even be asked
+    })  # fmt: skip
+    raw = ["H04L1218", "H01L21027", "H04L2906", "B65D5199", "A61B5022", "G06K900"]
+    res = resolve_labels(raw, "compact", CATALOGUE, concordance=conc)
+    assert conc.asked == ["H01L21027", "H04L2906", "B65D5199", "G06K900"]
+    assert res.labels == [
+        ResolvedLabel("H04L", "H04L 12/00", "H04L 12/18"),  # exact, untouched, still first
+        ResolvedLabel("H10B", "H10B 10/00", None),
+        ResolvedLabel("H04L", "H04L 9/00", None),
+        ResolvedLabel("B65D", "B65D 51/00", "B65D 51/00"),
+        ResolvedLabel("A61B", None, None),  # ambiguous, untouched
+        ResolvedLabel("G06K", None, None),  # the concordance had nothing: the fallback stays
+    ]
+    assert res.stats.as_dict() == {"exact": 1, "maingroup_only": 0, "subclass_only": 1, "ambiguous": 1, "missing": 0,
+                                   "concordance": 3}  # fmt: skip
+    assert res.stats.total == 6
+
+
+def test_concordance_none_leaves_a_missing_label_missing() -> None:
+    res = resolve_labels(["H01L2171"], "compact", CATALOGUE, concordance=FakeConcordance({}))
+    assert res.labels == [] and res.stats.missing == 1 and res.stats.concordance == 0
+
+
+def test_concordance_reads_structured_labels_as_printed_symbols() -> None:
+    conc = FakeConcordance({"H01L 21/027": ResolvedLabel("H10P", "H10P 76/00", None)})
+    raw = [
+        {"section": "H", "class": "01", "subclass": "L", "main_group": "0021", "subgroup": "0270"},
+        ("H", "01", "L", "23", None),  # main group only
+        ("H", "01", "L", None, None),  # subclass only
+        ("H", "04", "L", "12", "18"),  # exact: not asked
+    ]
+    res = resolve_labels(raw, "structured", CATALOGUE, concordance=conc)
+    assert conc.asked == ["H01L 21/027", "H01L 23/00", "H01L"]
+    assert res.labels == [ResolvedLabel("H10P", "H10P 76/00", None), ResolvedLabel("H04L", "H04L 12/00", "H04L 12/18")]
+    assert res.stats.concordance == 1 and res.stats.missing == 2 and res.stats.exact == 1
+
+
+def test_concordance_result_is_deduplicated_with_other_labels() -> None:
+    conc = FakeConcordance({"H01L2100": ResolvedLabel("H10B", "H10B 10/00", "H10B 10/00")})
+    res = resolve_labels(["H10B1000", "H01L2100"], "compact", CATALOGUE, concordance=conc)
+    assert res.labels == [ResolvedLabel("H10B", "H10B 10/00", "H10B 10/00")]
+    assert res.stats.exact == 1 and res.stats.concordance == 1
 
 
 def test_catalogue_is_any_container() -> None:
@@ -227,7 +288,8 @@ def test_stats_add() -> None:
     total = ResolutionStats()
     total.add(resolve_labels(["H04L1218", "H01L2100"], "compact", CATALOGUE).stats)
     total.add(resolve_labels(["A61B5022"], "compact", CATALOGUE).stats)
-    assert total.as_dict() == {"exact": 1, "maingroup_only": 0, "subclass_only": 0, "ambiguous": 1, "missing": 1}
+    assert total.as_dict() == {"exact": 1, "maingroup_only": 0, "subclass_only": 0, "ambiguous": 1, "missing": 1,
+                               "concordance": 0}
 
 
 # --- against the real 2026.01 catalogue, when the data file is checked out ------------------------
@@ -257,3 +319,40 @@ def test_samples_on_real_catalogue(real_catalogue: frozenset[str], code: str, ou
     got_outcome, label = _compact_outcome(code, real_catalogue)
     assert got_outcome is outcome
     assert (label.deepest if label else None) == deepest
+
+
+@pytest.fixture(scope="module")
+def wipo(real_catalogue: frozenset[str]):
+    from app.services.patents.concordance import load_concordance
+
+    return load_concordance(SOURCE_DIR, real_catalogue)  # checked against the stored manifest's SHA-256
+
+
+@pytest.mark.parametrize(
+    ("code", "outcome", "label"),
+    [
+        # one-to-one: H01L 23/04 (deleted 2026.01) -> H10W 76/12
+        ("H01L2304", Outcome.CONCORDANCE, ResolvedLabel("H10W", "H10W 76/00", "H10W 76/12")),
+        # one-to-many in one main group: no exact code is invented
+        ("H01L21027", Outcome.CONCORDANCE, ResolvedLabel("H10P", "H10P 76/00", None)),
+        # targets in two subclasses: no common vote-level ancestor -> still missing
+        ("H01L2171", Outcome.MISSING, None),
+        # G06K 9/00 itself went to G06F 18/xx in 2023.01 (its SUBCLASS_ONLY fallback was G06K)
+        ("G06K900", Outcome.CONCORDANCE, ResolvedLabel("G06F", "G06F 18/00", None)),
+        # H04L 29/06 (2022.01) -> 48 targets in H04L: the subclass only
+        ("H04L2906", Outcome.CONCORDANCE, ResolvedLabel("H04L", None, None)),
+        # current symbols are untouched
+        ("H04L1218", Outcome.EXACT, ResolvedLabel("H04L", "H04L 12/00", "H04L 12/18")),
+        ("A61B5022", Outcome.AMBIGUOUS, ResolvedLabel("A61B", None, None)),
+    ],
+)
+def test_real_wipo_lists(real_catalogue, wipo, code: str, outcome: Outcome, label: ResolvedLabel | None) -> None:
+    res = resolve_labels([code], "compact", real_catalogue, concordance=wipo)
+    assert res.labels == ([label] if label else [])
+    assert getattr(res.stats, outcome.value) == 1 and res.stats.total == 1
+
+
+def test_real_wipo_lists_structured(real_catalogue, wipo) -> None:
+    res = resolve_labels([{"section": "H", "class": "01", "subclass": "L", "main_group": "23", "subgroup": "04"}],
+                         "structured", real_catalogue, concordance=wipo)  # fmt: skip
+    assert res.labels == [ResolvedLabel("H10W", "H10W 76/00", "H10W 76/12")] and res.stats.concordance == 1
