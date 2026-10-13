@@ -83,7 +83,10 @@ are in ADR-0005 ("A PaECTER neighbour vote is the primary classifier").
    ```
 
    Set the local path on this network: the Hugging Face downloader stalls here. The directory must be
-   PaECTER at the pinned revision; its weights hash is checked at load.
+   PaECTER at the pinned revision; its weights hash is checked at load. Also set
+   `EMBEDDING_DEVICE=cuda` (in `.env` or the API's environment): with `auto`, a CUDA start-up failure
+   for lack of commit memory silently moves the models to the CPU (see [Memory](#memory)). The live
+   runs on 2026-10-14 used `cuda`.
 3. Restart the API. The setting is read at startup.
 4. Check `/ready`: `checks.neighbour_vote.state` must be `serving` and `patent_encoder_state` must be
    `ready`. The other states and their meaning are in [api.md](api.md). None of them makes `/ready`
@@ -178,7 +181,7 @@ HUPD tarballs (`YYYY.tar.gz`) are read from `HUPD_DATA_DIR` (default `D:/ipc_knn
 
 | hupd-2017 step | Result | Manifest |
 | --- | --- | --- |
-| ingest | 295,735 read, 2,000 held out, 293,711 selected, 26 with no resolvable label, **293,685 stored**; 148,239 labels resolved through the concordance; 401.4 s | `ingest_hupd-2017.json` |
+| ingest | 295,735 read, 24 skipped (abstract too short), 2,000 held out, 293,711 selected, 26 unresolvable (no resolvable label), **293,685 stored**; 148,239 labels resolved through the concordance; 401.4 s | `ingest_hupd-2017.json` |
 | embed | 293,685 imported, 0 text mismatches; 810.0 s | `embed_hupd-2017.json` |
 | index | m=32, ef_construction=200, maintenance_work_mem 512MB; **544.65 s, 749.6 MiB** | `index_hupd-2017.json` |
 | validate | 200 probes, k=100, ef_search 200: **recall@100 0.9884** (lowest probe 0.9596); HNSW p50 129 ms | `validate_hupd-2017.json` |
@@ -223,7 +226,21 @@ the first request with an error naming `USPTO_ODP_API_KEY`.
   the response's `total_hits`. If the API caps or misreports that count, a year is cut short without an
   error. Fix it before the first real USPTO load.
 
-Once both are resolved, check a small load in a separate corpus first, then load the full range:
+**Size and time, before a full load.** hupd-2017 used about 1.94 GB on sakthi for 293,685 documents
+(1.15 GB documents and vectors, 0.79 GB index; `db_size_hupd-2017.json`), about 6.6 kB per document.
+USPTO grants 2021–2025 are roughly 1.6 million utility patents, so expect **about 10 GB** if most of
+them are eligible. The hupd-2017 index took 545 s with `maintenance_work_mem` 512MB; a graph five times
+larger that no longer fits in that memory will take far longer, and so will the import. So:
+- check the free space on sakthi's PostgreSQL data volume first (with the server's operator; `ipc
+  --target sakthi db-info` shows only the current database size, 4255 MB on 2026-10-14);
+- plan the index step for a quiet period, and keep `--maintenance-work-mem 512MB` on sakthi (see above).
+
+**A smoke corpus stays in the tables.** `retire-patent-corpus` drops only the index, and there is no
+command that deletes a corpus's documents and vectors. A 2,000-document smoke load is small (about
+13 MB at the hupd rate), but it is permanent until someone removes it by hand.
+
+Once both blockers are resolved and the space is there, check a small load in a separate corpus first,
+then load the full range:
 
 ```bash
 uv run ipc --target sakthi load-patents --source uspto-odp --years 2021-2025 --corpus uspto-smoke \
