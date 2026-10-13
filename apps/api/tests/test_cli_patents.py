@@ -144,7 +144,8 @@ def settings(tmp_path: Path) -> Settings:
     source.mkdir()
     (source / "wipo_ipc_concordance_20260101.zip").write_bytes(b"")  # presence is what the CLI checks
     return Settings(_env_file=None, manifests_dir=tmp_path / "manifests", source_dir=source,
-                    hupd_data_dir=tmp_path / "hupd", uspto_odp_api_key="test-key-not-real")  # fmt: skip
+                    hupd_data_dir=tmp_path / "hupd", uspto_odp_api_key="test-key-not-real",
+                    patent_encoder_local_path=tmp_path / "paecter")  # fmt: skip
 
 
 @pytest.fixture
@@ -452,6 +453,36 @@ def test_embed_incomplete_exits_nonzero(world: World) -> None:
     r = _invoke("embed-patents", "--corpus", "it-i", "--from-npy", "D:/x", "--ids", "D:/x/ids.jsonl")
     assert r.exit_code == 1
     assert "PaecterError: D:/models/paecter is not a SentenceTransformer directory" in r.stderr
+
+
+def test_embed_without_a_local_copy_fails_instead_of_hanging(world: World, settings: Settings,
+                                                             monkeypatch: pytest.MonkeyPatch) -> None:  # fmt: skip
+    """No --model-path, no PATENT_ENCODER_LOCAL_PATH, not cached, the hub stalls: a bounded wait, one clear line."""
+    import threading
+
+    from app.runtime import load_patent_encoder
+
+    release = threading.Event()
+
+    def snapshot(repo: str, **kw: Any) -> str:
+        if kw.get("local_files_only"):
+            raise FileNotFoundError("not cached")
+        release.wait(30)
+        return "never"
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", snapshot)
+    no_local = settings.model_copy(update={"patent_encoder_local_path": None, "patent_encoder_download_timeout_s": 0.2})
+    monkeypatch.setattr(cli, "get_settings", lambda: no_local)
+    assert cli._patent_encoder.__doc__ and load_patent_encoder.__module__ == "app.runtime"  # the real resolver runs
+    world.corpora["it-h"] = _corpus("it-h", "loading", 5)
+    world.documents["it-h"] = 5
+    try:
+        r = _invoke("embed-patents", "--corpus", "it-h")
+    finally:
+        release.set()
+    assert r.exit_code == 1
+    assert "PatentEncoderUnavailable" in r.stderr and "PATENT_ENCODER_LOCAL_PATH" in r.stderr
+    assert "embed_corpus" not in world.names() and world.encoder_loads == []
 
 
 # --- index / validate / activate / retire -------------------------------------------------------------------

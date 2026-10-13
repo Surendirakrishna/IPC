@@ -482,13 +482,11 @@ def _ingest_step(conn: Any, corpus_id: str, *, source: str, years: list[int], li
 
 
 def _patent_encoder(model_path: Path | None) -> Any:
-    from app.runtime import patent_encoder_local_path
-    from app.services.embeddings.paecter import PaecterEncoder
+    """PaECTER from --model-path, else PATENT_ENCODER_LOCAL_PATH, else the HF cache, else a download bounded by
+    PATENT_ENCODER_DOWNLOAD_TIMEOUT_S (``PatentEncoderUnavailable``, a PaecterError: one clear line, exit 1)."""
+    from app.runtime import load_patent_encoder
 
-    s = get_settings()
-    return PaecterEncoder.load(local_path=model_path or patent_encoder_local_path(s),
-                               model_id=s.patent_encoder_model_id, revision=s.patent_encoder_model_revision,
-                               device=s.embedding_device)  # fmt: skip
+    return load_patent_encoder(get_settings(), model_path)
 
 
 def _embed_step(conn: Any, corpus_id: str, *, batch: int, from_npy: Path | None, ids: Path | None,

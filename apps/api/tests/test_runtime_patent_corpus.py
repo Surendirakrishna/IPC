@@ -6,7 +6,10 @@ No database and no models: the runtime's loaders, the serving-corpus reader and 
 from __future__ import annotations
 
 import contextlib
+import threading
+import time
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -114,6 +117,7 @@ def _runtime(tmp_path: Any, **settings: Any) -> Runtime:
 def test_encoder_loads_once_at_startup_and_reaches_the_pipeline(loaders: dict[str, Any], tmp_path: Any) -> None:
     rt = _runtime(tmp_path, neighbour_vote_enabled=True)
     rt._load()
+    assert rt.wait_for_patent_encoder(5)
     assert rt.state == "ready", rt.error
     assert loaders["encoder_loads"] == 1
     assert rt.patent_encoder is loaders["encoder"]
@@ -127,6 +131,7 @@ def test_encoder_loads_once_at_startup_and_reaches_the_pipeline(loaders: dict[st
 def test_vote_disabled_loads_no_encoder(loaders: dict[str, Any], tmp_path: Any) -> None:
     rt = _runtime(tmp_path, neighbour_vote_enabled=False)
     rt._load()
+    assert rt.wait_for_patent_encoder(5)
     assert rt.state == "ready", rt.error
     assert loaders["encoder_loads"] == 0
     assert rt.patent_encoder is None and rt.pipeline.patent_encoder is None
@@ -137,6 +142,7 @@ def test_encoder_failure_keeps_the_runtime_ready_and_is_reported(loaders: dict[s
     loaders["error"] = RuntimeError("CUDA error: out of memory")
     rt = _runtime(tmp_path, neighbour_vote_enabled=True)
     rt._load()
+    assert rt.wait_for_patent_encoder(5)
     assert rt.state == "ready", rt.error  # the definition fallback still serves
     assert rt.patent_encoder is None
     assert rt.patent_encoder_error == "RuntimeError: CUDA error: out of memory"
@@ -154,6 +160,7 @@ def test_definition_only_runtime_keeps_the_served_fingerprint(loaders: dict[str,
     from the configured settings (vote enabled), so a fitted artifact matches the serving API."""
     rt = Runtime(_settings(calibration_dir=tmp_path, neighbour_vote_enabled=True), definition_only=True)
     rt._load()
+    assert rt.wait_for_patent_encoder(5)
     assert rt.state == "ready", rt.error
     assert loaders["encoder_loads"] == 0
     assert rt.pipeline.s.neighbour_vote_enabled is False
@@ -167,6 +174,7 @@ def test_revision_mismatch_disables_the_vote_with_a_pipeline_warning(loaders: di
     loaders["encoder"] = FakePatentEncoder(revision="0" * 40)
     rt = _runtime(tmp_path, neighbour_vote_enabled=True)
     rt._load()
+    assert rt.wait_for_patent_encoder(5)
     store = FakeStore(_corpus())
     rt.pipeline.patent_store = store
     att = rt.pipeline._attempt_vote(SimpleNamespace(), ClassifyRequest(abstract=ABSTRACT), {})
@@ -190,15 +198,134 @@ def test_startup_logs_a_corpus_revision_mismatch(loaders: dict[str, Any], tmp_pa
     rt = _runtime(tmp_path, neighbour_vote_enabled=True)
     with caplog.at_level("WARNING", logger="app.runtime"):
         rt._load()
+        assert rt.wait_for_patent_encoder(5)
     assert rt.state == "ready"
     assert any("neighbour vote is disabled until they match" in r.getMessage() for r in caplog.records)
 
 
-def test_local_path_comes_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(runtime_mod.PATENT_ENCODER_LOCAL_PATH_ENV, raising=False)
-    assert runtime_mod.patent_encoder_local_path(_settings()) is None
-    monkeypatch.setenv(runtime_mod.PATENT_ENCODER_LOCAL_PATH_ENV, "D:/ipc_knn/models/paecter")
-    assert runtime_mod.patent_encoder_local_path(_settings()).as_posix() == "D:/ipc_knn/models/paecter"
+def test_startup_reaches_ready_while_the_encoder_load_blocks(loaders: dict[str, Any], tmp_path: Any,
+                                                            monkeypatch: pytest.MonkeyPatch) -> None:  # fmt: skip
+    """A stalled PaECTER load (e.g. a hung hub download) must not hold the API in `loading` (wave 4 review)."""
+    release, entered = threading.Event(), threading.Event()
+    enc = FakePatentEncoder()
+
+    def blocking_load(settings: Settings) -> FakePatentEncoder:
+        entered.set()
+        assert release.wait(10), "test never released the encoder load"
+        return enc
+
+    monkeypatch.setattr(runtime_mod, "load_patent_encoder", blocking_load)
+    rt = _runtime(tmp_path, neighbour_vote_enabled=True)
+    rt._load()  # returns although the encoder load is still blocked
+    try:
+        assert entered.wait(5)
+        assert rt.state == "ready"
+        assert rt.patent_encoder_state == "loading" and rt.patent_encoder is None
+        assert rt.pipeline.patent_encoder is None
+        # meanwhile the vote reports the encoder as unavailable and the fallback serves
+        rt.pipeline.patent_store = FakeStore(_corpus())
+        att = rt.pipeline._attempt_vote(SimpleNamespace(), ClassifyRequest(abstract=ABSTRACT), {})
+        assert att.reason == "patent_encoder_unavailable"
+        monkeypatch.setattr(system, "database_configured", lambda: True)
+        monkeypatch.setattr(system, "_serving_patent_corpus", lambda rt_: (True, _corpus(), 293_711))
+        nv = system.neighbour_vote_state(rt)
+        assert nv["state"] == "patent_encoder_unavailable" and "still loading" in nv["reason"]
+        assert nv["patent_encoder_state"] == "loading"
+    finally:
+        release.set()
+    assert rt.wait_for_patent_encoder(5)
+    assert rt.patent_encoder_state == "ready"
+    assert rt.patent_encoder is enc and rt.pipeline.patent_encoder is enc  # attached once loaded
+    assert system.neighbour_vote_state(rt)["state"] == "serving"
+
+
+def test_local_path_from_env_file_is_honoured(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """PATENT_ENCODER_LOCAL_PATH in .env reaches the loader (it used to be read from os.environ only)."""
+    monkeypatch.delenv("PATENT_ENCODER_LOCAL_PATH", raising=False)
+    env = tmp_path / ".env"
+    env.write_text("PATENT_ENCODER_LOCAL_PATH=D:/ipc_knn/models/paecter\n", encoding="utf-8")
+    s = Settings(_env_file=env)
+    assert s.patent_encoder_local_path == Path("D:/ipc_knn/models/paecter")
+
+    def no_hub(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a configured local path must not touch the Hugging Face hub or its cache")
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", no_hub)
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr("app.services.embeddings.paecter.PaecterEncoder.load",
+                        lambda **kw: seen.update(kw) or FakePatentEncoder())
+    runtime_mod.load_patent_encoder(s)
+    assert seen["local_path"] == Path("D:/ipc_knn/models/paecter")
+    assert (seen["model_id"], seen["revision"]) == (PAECTER_MODEL_ID, PAECTER_REVISION)
+    assert _settings().patent_encoder_local_path is None  # no .env: unset
+
+
+def test_resolve_uses_the_hf_cache_without_network(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def snapshot(repo: str, **kw: Any) -> str:
+        calls.append(kw)
+        assert kw.get("local_files_only") is True, "only the cache may be consulted"
+        return str(tmp_path / "snapshots" / PAECTER_REVISION)
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", snapshot)
+    assert runtime_mod.resolve_patent_encoder_path(_settings()) == tmp_path / "snapshots" / PAECTER_REVISION
+    assert calls[0]["revision"] == PAECTER_REVISION
+
+
+def test_hub_download_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    release = threading.Event()
+
+    def snapshot(repo: str, **kw: Any) -> str:
+        if kw.get("local_files_only"):
+            raise FileNotFoundError("not cached")
+        release.wait(30)  # a stalled download
+        return "never"
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", snapshot)
+    t0 = time.perf_counter()
+    try:
+        with pytest.raises(runtime_mod.PatentEncoderUnavailable, match="did not finish within 0 s.*PATENT_ENCODER_LOCAL_PATH"):
+            runtime_mod.resolve_patent_encoder_path(_settings(patent_encoder_download_timeout_s=0.2))
+        assert time.perf_counter() - t0 < 5
+    finally:
+        release.set()
+
+
+def test_hub_download_error_is_clean(monkeypatch: pytest.MonkeyPatch) -> None:
+    def snapshot(repo: str, **kw: Any) -> str:
+        raise OSError("connection reset")
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", snapshot)
+    with pytest.raises(runtime_mod.PatentEncoderUnavailable, match="OSError: connection reset"):
+        runtime_mod.resolve_patent_encoder_path(_settings())
+
+
+def test_stalled_download_leaves_the_api_serving(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """End to end through the real resolver and loader: no local path, not cached, the download stalls -> the
+    runtime is ready at once and the encoder ends `failed` with the timeout message."""
+    release = threading.Event()
+
+    def snapshot(repo: str, **kw: Any) -> str:
+        if kw.get("local_files_only"):
+            raise FileNotFoundError("not cached")
+        release.wait(30)
+        return "never"
+
+    monkeypatch.delenv("PATENT_ENCODER_LOCAL_PATH", raising=False)
+    monkeypatch.setattr("huggingface_hub.snapshot_download", snapshot)
+    monkeypatch.setattr("app.services.embeddings.providers.get_provider", lambda s: FakeProvider())
+    monkeypatch.setattr("app.services.classification.reranker.get_reranker", lambda s: FakeReranker())
+    monkeypatch.setattr(fp_mod, "current_fingerprint", lambda s, p, r: ({}, "fp"))
+    rt = _runtime(tmp_path, neighbour_vote_enabled=True, patent_encoder_download_timeout_s=0.3)
+    try:
+        rt._load()
+        assert rt.state == "ready"
+        assert rt.wait_for_patent_encoder(5)
+        assert rt.patent_encoder_state == "failed" and rt.patent_encoder is None
+        assert "did not finish within" in rt.patent_encoder_error
+    finally:
+        release.set()
 
 
 # --- readiness ----------------------------------------------------------------------------------------------
@@ -215,7 +342,7 @@ def _ready_runtime(tmp_path: Any, encoder: Any = None, **settings: Any) -> Runti
     [
         ((False, None, None), FakePatentEncoder(), "no_serving_corpus", "migration 0004"),
         ((True, None, None), FakePatentEncoder(), "no_serving_corpus", "No validated patent corpus is serving"),
-        ((True, _corpus(), 293_711), None, "patent_encoder_unavailable", "not loaded (models are ready)"),
+        ((True, _corpus(), 293_711), None, "patent_encoder_unavailable", "not loaded (still loading)"),
         ((True, _corpus(encoder_model_revision="abc"), 293_711), FakePatentEncoder(), "patent_encoder_unavailable",
          "was embedded with"),
         ((True, _corpus(), 99), FakePatentEncoder(), "corpus_too_small", "fewer than NEIGHBOUR_K=100"),
@@ -253,7 +380,8 @@ def test_neighbour_vote_state_disabled_reads_nothing(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(system, "_serving_patent_corpus", boom)
     nv = system.neighbour_vote_state(_ready_runtime(tmp_path, neighbour_vote_enabled=False))
     assert nv == {"enabled": False, "state": "disabled", "degraded": False, "reason": nv["reason"],
-                  "patent_encoder": None, "patent_encoder_error": None, "patent_corpus": None, "vote_settings": None}
+                  "patent_encoder": None, "patent_encoder_state": "disabled", "patent_encoder_error": None,
+                  "patent_corpus": None, "vote_settings": None}
     assert "NEIGHBOUR_VOTE_ENABLED=false" in nv["reason"]
 
 

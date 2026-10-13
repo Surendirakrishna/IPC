@@ -117,6 +117,7 @@ def neighbour_vote_state(rt: Runtime) -> dict[str, Any]:
         "degraded": False,
         "reason": None,
         "patent_encoder": {"model_id": enc.model_id, "model_revision": enc.revision} if enc is not None else None,
+        "patent_encoder_state": rt.patent_encoder_state,  # disabled | not_started | loading | ready | failed
         "patent_encoder_error": rt.patent_encoder_error,
         "patent_corpus": None,
         "vote_settings": None,
@@ -146,7 +147,12 @@ def neighbour_vote_state(rt: Runtime) -> dict[str, Any]:
     out["patent_corpus"] = {"corpus_id": str(corpus.corpus_id), "source": corpus.source, "document_count": count,
                             "labels_ipc_edition": corpus.label_ipc_edition, "state": corpus.state}
     if enc is None:
-        why = rt.patent_encoder_error or f"models are {rt.state}"
+        if rt.patent_encoder_state == "failed":
+            why = f"failed: {rt.patent_encoder_error}"
+        elif rt.state != "ready":
+            why = f"models are {rt.state}"
+        else:
+            why = "still loading"
         return degraded("patent_encoder_unavailable", f"The patent encoder (PaECTER) is not loaded ({why}); codes "
                                                       "come from definition matching.")
     if (enc.model_id, enc.revision) != (corpus.encoder_model_id, corpus.encoder_model_revision):
@@ -167,14 +173,15 @@ def neighbour_vote_state(rt: Runtime) -> dict[str, Any]:
 @router.get("/ready")
 def ready() -> JSONResponse:
     rt = get_runtime()
-    checks: dict[str, Any] = {"models": rt.state, "models_error": rt.error}
+    models = rt.state  # read once: the loader thread may flip it while the DB checks below run
+    checks: dict[str, Any] = {"models": models, "models_error": rt.error}
     try:
         corpus = _corpus_state()
     except Exception as exc:  # noqa: BLE001
         corpus = {"database": "unreachable", "error": type(exc).__name__}
     checks["corpus"] = corpus
     ok = (
-        rt.state == "ready"
+        models == "ready"
         and corpus.get("schema") == "ok"
         and corpus.get("active_release") is not None
         and corpus.get("serving_embedding_run") is not None
