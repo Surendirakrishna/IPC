@@ -3,10 +3,12 @@
 ipc-classifier classifies a patent abstract into IPC codes, with evidence for each code. You can also
 supply the specification, claims and title, but they are optional. For each request the system:
 
-- runs PostgreSQL full-text search and BGE-M3 vector search (pgvector HNSW) over the IPC catalogue;
-- fuses the two result lists with reciprocal rank fusion and expands them with parents, siblings
-  and references;
-- reranks candidates with BGE-reranker-v2-m3;
+- routes to likely subclasses first, then runs PostgreSQL full-text search and BGE-M3 vector search
+  (pgvector HNSW) for groups inside them, over the WIPO IPC 2026.01 scheme with its real dotted hierarchy;
+- fuses the two result lists with reciprocal rank fusion and expands them with parents and siblings
+  (a cross-reference never adds a candidate);
+- reranks candidates with BGE-reranker-v2-m3, then applies WIPO precedence rules between supported
+  candidates;
 - quotes supporting passages with exact offsets and lists unresolved ambiguity;
 - applies an optional LLM step that can only choose from the candidate codes;
 - maps the result to a field of invention and attaches calibrated per-code confidence.
@@ -18,12 +20,12 @@ The first output is always the two-row summary:
 | Classification (IPC) | H04W 12/0433 — confidence: not calibrated |
 
 The table above is the **live result for the QKD abstract-only request** in
-`data/evaluation/qkd_contract_request.json` under selection policy v2. It is not a hard-coded value;
-the full response is in `data/manifests/acceptance_qkd_sakthi_policy_v2.json`.
+`data/evaluation/qkd_contract_request.json` with the current pipeline (WIPO 2026.01 rebuild, 2026-10-11).
+It is not a hard-coded value; the full response is in `data/manifests/acceptance_qkd_sakthi_wipo2026.json`.
 
 The supported code carries a review note: H04W's "wireless" scope isn't evidenced by the abstract.
-H04L 9/08 "Key distribution" is listed as an alternative. Policy v1 returned H04L 9/08 for this
-example, but v1 abstained on 87% of real applications (see the benchmark).
+H04L 9/14, 9/06 and other H04L 9 groups are listed as alternatives; policy v1 returned H04L 9/08.
+While WIPO notes were still in the reranker input, this request returned H02J 50/80 (wireless power).
 
 No calibrator has been fitted, so confidence is always `null` / "not calibrated"; no invented
 percentages are shown.
@@ -34,9 +36,9 @@ percentages are shown.
 | --- | --- |
 | Source validation | ✅ The hashes match the expected snapshot and every count matches (80,145 records, 589 duplicate main groups, 15,035 reference edges, 0 blocking findings). Manifest: `data/manifests/validation_20260101.json` |
 | Local corpus (docker pgvector, tests only) | ✅ Imported and activated. BGE-M3 run `emb-bge_m3-72c8b3da25a4` has 80,145/80,145 vectors, is validated, has its HNSW index (m=64, ef_construction=800; recall@100 0.955 against exact search) and is serving. |
-| **sakthi DB (serving)** | ✅ The default target since 2026-10-10: ShaktiDB 18.4 (PostgreSQL 18.4), pgvector 0.8.2, `ipc_db` on 192.168.200.29:11233. The catalogue is imported and active. BGE-M3 run `emb-bge_m3-15844bc14556` is float32 and validated, with 80,145/80,145 vectors. HNSW m=64/ef_construction=800 was built in 97 s (626 MiB) and gives recall@100 of 0.949 against exact search. The database is 1,375 MB. `/ready` is 200, and the QKD request returns 200 in about 9.8 s (`data/manifests/acceptance_qkd_sakthi.json`). |
+| **sakthi DB (serving)** | ✅ The default target since 2026-10-10: ShaktiDB 18.4 (PostgreSQL 18.4), pgvector 0.8.2, `ipc_db` on 192.168.200.29:11233. The catalogue is imported and active. Migrated to Alembic `0003` and re-imported with the WIPO 2026.01 master files on 2026-10-11 (real dotted hierarchy, notes with owner/range/edition and rule meaning). BGE-M3 run `emb-bge_m3-61c53c85a23d` (dotted-path text) is float32 and validated, with 80,145/80,145 vectors. HNSW m=64/ef_construction=800 was built in 105 s (626 MiB) and gives recall@100 of 0.961 against exact search (ef_search 500). The pre-rebuild vectors, text and run are kept in `rollback_20261011_*` tables. The QKD request returns 200 in about 14 s (`data/manifests/acceptance_qkd_sakthi_wipo2026.json`). The VPN link to sakthi has dropped several times; benchmark runs pause until it is back. |
 | API / UI / CLI | ✅ Implemented. 74 backend unit tests (2026-10-11), 9 database integration tests (local docker DB) and 5 Playwright browser tests (including the live QKD run against sakthi) pass. |
-| Benchmark (IP India, 123 held-out applications) | Policy v2, abstract-only: answers 98.4%; first code matches a recorded IPC subclass 28.5%, main group 17.1%, exact 8.1%; field label 41.6%. v1 abstained 87.8%. See [docs/benchmark-ipindia.md](docs/benchmark-ipindia.md). **These describe the pipeline before the 2026-10-11 rebuild; held-out re-scoring is pending.** |
+| Benchmark (IP India, 123 held-out applications) | Re-scored once after the rebuild (2026-10-12), abstract-only: answers 97.6%; first code matches a recorded subclass 30.9%, main group 17.9%, exact 8.9% (previous pipeline 28.5 / 17.1 / 8.1, within the CIs). A recorded symbol is in the top 100 candidates for 78.0 / 59.3 / **44.7%** (previously 71.5 / 48.0 / 26.8). With claims as evidence only: 29.3 / 16.3 / 8.1 (previously, with claims voting: 27.6 / 10.6 / 2.4). Median 9.5 s. See [docs/benchmark-ipindia.md](docs/benchmark-ipindia.md). |
 | Benchmark, dev set after the WIPO 2026.01 rebuild (2026-10-11) | Dev only (130 applications, used for design decisions). With subclass-first retrieval and no WIPO notes in the reranker, the first code matches a recorded subclass 42.3%, main group 24.6%, exact 11.5% (old flat v2 on the same set: 37.7 / 22.3 / 10.8). The correct code is in the top 100 candidates for 83.1 / 66.2 / 50.0%. Median 10.1 s per document. See [Dev-set results](docs/benchmark-ipindia.md#dev-set-results-after-the-wipo-202601-rebuild-2026-10-11). |
 | Review and reranker-training tooling | ✅ `ipc families` (patent-family grouping, family-safe splits; the current dev and test sets share no family), `ipc review-queue` / `review-finalize` (blinded expert review, then expert-labelled JSONL), `ipc mine-negatives` (hard negatives from nearby parts of the scheme). See [docs/model-operation.md](docs/model-operation.md#review-family-splits-and-reranker-training-data). ⛔ No reviewed labels yet, so no reranker has been trained. |
 | Calibration | Harness ✅. Fitted calibrator ⛔: no expert-labelled data. The review tooling above produces the input it needs. |

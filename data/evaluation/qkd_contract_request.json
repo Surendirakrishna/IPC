@@ -1,10 +1,3 @@
-{
-  "abstract": "The present invention discloses a Quantum Key Distribution (QKD) protocol for multi-node smart grid encryption configured to provide secure cryptographic key generation, distribution, management, and renewal among a plurality of interconnected smart grid nodes. The system comprises smart meters, substations, intelligent electronic devices, phasor measurement units, renewable energy systems, energy storage units, electric vehicle charging stations, and control centers interconnected through communication networks. Quantum communication channels are utilized to exchange quantum states between authorized nodes for generating shared secret key material, while authenticated classical communication channels support basis reconciliation, parameter estimation, error correction, privacy amplification, and key validation. A multi-node key management module coordinates key allocation, synchronization, storage, rotation, and revocation according to node authorization and communication requirements. The generated quantum keys are applied by an encryption module to protect measurement data, control commands, operational information, and other sensitive smart grid communications. A monitoring module detects abnormal quantum transmission conditions and potential security interference, while a fault-management mechanism can initiate key regeneration or terminate affected communication sessions upon detection of security anomalies. The proposed protocol further supports centralized, distributed, or hierarchical key-management configurations for accommodating heterogeneous and dynamically changing smart grid networks. Accordingly, the invention provides an integrated quantum-based security framework for improving confidentiality, integrity, authentication, and resilience of multi-node smart grid communications against unauthorized access, interception, and cryptographic key compromise.",
-  "specification": null,
-  "claims": null,
-  "title": null,
-  "taxonomy_version": "20260101",
-  "target_level": "group",
-  "max_results": 5,
-  "use_llm": false
-}
+version https://git-lfs.github.com/spec/v1
+oid sha256:708a0d7b3e3d6dbe00c633b9ce24ebf53800d2e9a4295af9f44a878d872eac1f
+size 2091

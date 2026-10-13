@@ -1,9 +1,3 @@
-{
-  "records": 80145,
-  "limit": 512,
-  "p50": 111,
-  "p99": 234,
-  "max": 331,
-  "max_code": "C23C0022480000",
-  "over_limit": 0
-}
+version https://git-lfs.github.com/spec/v1
+oid sha256:ca2312a199758f2c7e6ba4f039001e69eb33996c05b78990dbe539731230dded
+size 141

@@ -1,27 +1,28 @@
 # Benchmark: IP India published applications
 
 **Summary.** On 123 held-out real Indian patent applications (title + abstract only), the current
-pipeline (policy v2, field mapping v2) answers 98.4% of the time. Its first code matches a recorded
+pipeline (WIPO 2026.01 hierarchy, subclass-first retrieval, reranker without WIPO notes, policy v2 with
+WIPO precedence rules; scored 2026-10-12) answers 97.6% of the time. Its first code matches a recorded
 IPC symbol at:
-- **subclass:** 28.5% (95% CI 21.2–37.0);
-- **main group:** 17.1% (11.4–24.7);
-- **exact symbol:** 8.1% (4.5–14.3).
+- **subclass:** 30.9% (95% CI 23.4–39.5);
+- **main group:** 17.9% (12.1–25.6);
+- **exact symbol:** 8.9% (5.1–15.3).
 
-Its field of invention matches the office's label **41.6%** (33.3–50.4) of the time.
+A recorded symbol is among the first 100 candidates for 78.0% (subclass), 59.3% (main group) and
+**44.7% (exact)** of applications. The previous pipeline managed 71.5%, 48.0% and 26.8%. Its field of
+invention matches the office's label 40.8% (32.6–49.6) of the time.
 
-The previous policy (v1) abstained on 87.8% of the same documents, with subclass top-1 of 7.3% and
-field agreement of 0%.
+The top-1 gains over the previous pipeline (28.5% / 17.1% / 8.1%) are within the confidence
+intervals. The candidate-recall gains are not. Policy v1 abstained on 87.8% of the same documents.
 
 Treat these as **agreement with the IPC recorded on publication**, not examiner-verified accuracy.
 They're useful for comparing versions of this system, not as a claim of official classification
 accuracy.
 
-> **2026-10-11: the pipeline has changed since these held-out figures.** It now uses the WIPO
-> 2026.01 hierarchy, subclass-first retrieval and a reranker without WIPO notes. On the dev set it
-> beats the version above at every level (see
+> The held-out test set was re-scored once, on 2026-10-12, after the WIPO 2026.01 rebuild had been
+> decided on the dev set (see
 > [Dev-set results after the WIPO 2026.01 rebuild](#dev-set-results-after-the-wipo-202601-rebuild-2026-10-11)).
-> The held-out test set has not been re-scored yet, so the figures above still describe the
-> previous pipeline.
+> The previous pipeline's held-out tables are kept below for comparison.
 
 ## Data
 
@@ -78,7 +79,116 @@ the first supported code, and abstention counts as wrong.
 
 ## Results on the held-out test set (123 applications)
 
-### Abstract-only (title + abstract)
+### After the WIPO 2026.01 rebuild (scored once, 2026-10-12)
+
+Configuration: the shipped defaults, chosen on dev only.
+- WIPO 2026.01 hierarchy and dotted-path embeddings (`emb-bge_m3-61c53c85a23d`).
+- Subclass routing by group vote (300-deep search, top 30 subclasses).
+- `RERANK_OFFICIAL_CONTEXT=false`.
+- Precedence rules on, place rules as notes only.
+- Claims kept out of retrieval.
+
+Runs: `data/manifests/benchmarks/wipo2026_test__*`. Scored with `_score_docs`; live results, no replay.
+
+| Abstract-only | Abstains | Subclass top-1 | Main-group top-1 | Exact top-1 | Field label | Median s |
+| --- | --- | --- | --- | --- | --- | --- |
+| Previous pipeline (v2) | 1.6% | 28.5% (21.2–37.0) | 17.1% (11.4–24.7) | 8.1% (4.5–14.3) | 41.6% | 7.4 |
+| **After rebuild** | 2.4% | **30.9% (23.4–39.5)** | **17.9% (12.1–25.6)** | **8.9% (5.1–15.3)** | 40.8% | 9.5 |
+
+| Recorded symbol among the first *k* candidates | Subclass | Main group | Exact |
+| --- | --- | --- | --- |
+| hit@10, previous → after | 71.5% → 74.8% | 48.0% → 52.0% | 20.3% → 22.0% |
+| hit@100, previous → after | 71.5% → **78.0%** | 48.0% → **59.3%** | 26.8% → **44.7%** |
+
+Per-stage recall after the rebuild: subclass routing kept a recorded subclass in its 30 subclasses for
+59.5% of applications (@1 16%, @5 42%, @10 50%). Group candidate generation reached 55.5% / 31.6% /
+17.0% mean recall at subclass / main group / exact. Routing is now the largest single loss. WIPO
+precedence rules demoted no candidate in this set.
+
+| Abstract + claims (125; 72 have claims) | Subclass top-1 | Main-group top-1 | Exact top-1 | Median s |
+| --- | --- | --- | --- | --- |
+| Previous pipeline: claims voted like the abstract | 27.6% | 10.6% | 2.4% | 15.2 |
+| **After rebuild: claims are evidence only (default)** | 29.3% (22.0–37.8) | **16.3% (10.8–23.8)** | **8.1% (4.5–14.3)** | 10.5 |
+
+Keeping claims out of retrieval removes most of the loss that claims used to cause. Supplying claims as
+evidence only is still 1–2 documents behind abstract-only, as on dev.
+
+Independent-claim weighting (`CLAIMS_RETRIEVAL_MODE=independent_weighted`, `CLAIM_SOURCE_WEIGHT=0.35`,
+chosen on dev). **Partial run: 106 of 125.** The last 19 were not run, because Windows Application
+Control blocked a scikit-learn DLL when the API started.
+
+| Same 106 applications | Subclass top-1 | Main-group top-1 | Exact top-1 | Subclass routing recall (30) |
+| --- | --- | --- | --- | --- |
+| Claims evidence only | 30.8% | 17.3% | 9.6% | 0.599 |
+| Independent claims vote at 0.35 | **36.5%** | **21.2%** | **11.5%** | 0.640 |
+
+The weight 0.35 was chosen on dev alone (see [Claims weighting (dev)](#claims-weighting-dev)). This
+held-out run only confirms that choice: same direction as on dev (+2/+3/+1 of 101), larger here
+(+6/+4/+2 of 106). It was not used to pick the weight or the mode, and it is partial. The default stays
+`off`, as the review asked. Turning it on should rest on the dev result plus a complete held-out run,
+or a fresh test sample. This test set should not be re-run with other weights.
+
+### Nearest-neighbour vote over labelled patents (offline experiment, 2026-10-13)
+
+A different method, not a change to the API. It does not match the abstract against IPC definition
+text. Instead, it finds the most similar **already-classified patents** and lets their IPC codes vote.
+
+- **Corpus:** 293,711 USPTO applications filed in 2017 (HUPD, `HUPD/hupd` on Hugging Face), each with
+  title, abstract and USPTO-assigned IPC codes (3.8 on average).
+- **Codes against 2026.01:** 86% of corpus codes resolve to an exact 2026.01 symbol. Codes since
+  removed vote at the deepest level that still exists. H01L is absent from 2026.01, so its codes (6.6%)
+  cannot vote at all.
+- **Embedding:** title + abstract, encoded with PaECTER (patent-citation-trained, 1024-dim) or BGE-M3
+  (the API's model).
+- **Vote:** the k nearest applications vote with weight exp((s − s₁)/T). The main IPC label counts
+  1 and secondary labels count β. The first code is chosen top-down: subclass, then main group, then
+  subgroup.
+- **Tuning:** k, T and β were chosen on the dev set only, by mean top-1 across the three levels. The
+  test set was scored once per model.
+
+| Held-out test, 123 applications | Subclass top-1 | Main-group top-1 | Exact top-1 | Subclass hit@3 | Main-group hit@3 |
+| --- | --- | --- | --- | --- | --- |
+| Current pipeline (after rebuild) | 30.9% (23.4–39.5) | 17.9% (12.1–25.6) | 8.9% (5.1–15.3) | 53.7% | 34.1% |
+| kNN vote, BGE-M3 (k=10, T=0.05, β=1) | 63.4% (54.6–71.4) | 43.1% (34.7–51.9) | 22.8% (16.2–30.9) | 78.9% | 58.5% |
+| **kNN vote, PaECTER (k=100, T=0.005, β=1)** | **65.9% (57.1–73.6)** | **48.0% (39.3–56.7)** | **31.7% (24.1–40.4)** | **88.6%** | **65.9%** |
+
+On 1,916 held-out 2017 USPTO applications, which carry USPTO-assigned rather than applicant-declared
+codes, PaECTER reaches 81.7 / 67.9 / 46.8% and BGE-M3 78.1 / 61.8 / 41.5%. PaECTER is ahead at every
+level, with non-overlapping intervals at main group and exact. These hold-out figures are somewhat
+optimistic, because about 1% of hold-out applications have a near-duplicate in the corpus
+(similarity ≈ 1.0, likely continuations).
+
+Leakage check: no IP India test application has a near-duplicate in the corpus. The highest
+nearest-neighbour similarity is 0.986 (PaECTER) and 0.959 (BGE-M3).
+
+**The vote share works as a probability without calibration.** Each code's score is the
+similarity-weighted share of neighbours that carry it. For PaECTER's first code on the test set:
+
+| Subclass vote share (bin) | 0.2–0.4 | 0.4–0.6 | 0.6–0.8 | 0.8–1.0 |
+| --- | --- | --- | --- | --- |
+| Applications | 20 | 35 | 39 | 28 |
+| Mean vote share | 0.34 | 0.51 | 0.69 | 0.93 |
+| Recorded subclass matched | 50% | 57% | 67% | 89% |
+
+The hold-out (1,916) gives the same picture at main-group level: 0.30 → 35%, 0.51 → 62%, 0.70 → 74%,
+0.93 → 90%. A fitted calibrator would still help in the low bins.
+
+The QKD example returns **H04L 9/08 "Key distribution"** at 87% vote share. H04L 9/14 (33%) and
+H04B 10/70 "Photonic quantum communication" (17%) are listed next. The nearest corpus applications
+are three US quantum key distribution filings.
+
+Caveats:
+- 123 test documents give intervals of about ±9 points.
+- The ground truth is applicant-declared IP India IPC.
+- The corpus is nine years older than the queries. It cannot predict subclasses created since 2017
+  (e.g. G06V) and loses H01L, so a recent corpus should do better, not worse.
+- Choosing 3 parameters from 224 combinations on 130 dev documents overfits dev slightly (PaECTER dev
+  73.1 / 59.2 / 35.4%). The test figures are the ones to quote.
+
+Code and outputs: `data/manifests/benchmarks/knn_hupd/` (`report.json`, `results_test_*.jsonl`).
+Corpus and vectors live outside the repo in `D:/ipc_knn/`.
+
+### Previous pipeline: abstract-only (title + abstract)
 
 | Variant | Abstains | Subclass top-1 | Main-group top-1 | Exact top-1 | Subclass, any returned code | Field label |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -96,7 +206,7 @@ Candidate ranking, before selection:
 | hit@5 | 63.4% | 37.4% | 17.1% |
 | hit@10 | 71.5% | 48.0% | 20.3% |
 
-### Abstract + claims
+### Previous pipeline: abstract + claims
 
 The same 125 test applications were run with the recorded claims added. 72 have claims; the other 53
 behave as abstract-only. The policy settings are the abstract-tuned v2 values.

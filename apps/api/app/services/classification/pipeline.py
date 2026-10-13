@@ -58,6 +58,7 @@ from app.services.classification.summary import build_summary
 from app.services.confidence.calibrator import ConfidenceService
 from app.services.embeddings.providers import EmbeddingProvider
 from app.services.fields.mapping import FieldMapping, field_of_invention
+from app.services.ingestion.wipo import display_symbol
 from app.services.retrieval.expansion import expand
 from app.services.retrieval.fusion import FusedCandidate, ViewHits, fuse, vote_subclasses
 from app.services.retrieval.keyword import build_websearch_query, extract_terms, keyword_search
@@ -74,6 +75,10 @@ LEVEL_TYPES: dict[str, tuple[str, ...]] = {
     "class": ("class",),
 }
 ENUM_CUE_RE = re.compile(r"\b(comprises|comprising|includes|including|such as|consisting of|e\.g\.)\b", re.I)
+
+
+# Rule kinds listed on a candidate for the reviewer (the rules themselves are applied in rules.py).
+RULE_REVIEW_KINDS = ("precedence", "place_last", "place_first")
 
 
 class PipelineUnavailable(RuntimeError):
@@ -726,8 +731,13 @@ class ClassificationPipeline:
             ambiguity.append("Abstract-only candidate review; applicable scope notes and priority rules still need "
                              "verification against the official scheme.")
         if r.official_context:
-            ambiguity.append("Version-matched WIPO notes, definitions and reference wording were included in the "
-                             "candidate scope; confirm any conditional or precedence rule applies to this disclosure.")
+            used = "were included in the ranking input" if self.s.rerank_official_context else "apply to this code"
+            ambiguity.append(f"Version-matched WIPO notes, definitions and reference wording {used}; confirm any "
+                             "conditional or precedence rule applies to this disclosure.")
+            rules = [item for item in r.official_context if item.get("rule_kind") in RULE_REVIEW_KINDS]
+            for item in rules[:3]:
+                ambiguity.append(f"WIPO {item['rule_kind'].replace('_', ' ')} rule for "
+                                 f"{display_symbol(item['owner_symbol'])}: {item['text'][:300]}")
         if s_.missing_terms:
             ambiguity.append("Title terms not found in the reviewed text: " + ", ".join(s_.missing_terms[:8]) + ".")
         if depends_optional:

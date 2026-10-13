@@ -1,25 +1,3 @@
-{
-  "run_id": "emb-gemma_api-e1b53a3633ed",
-  "storage_table": "ipc_embeddings_gemma",
-  "expected": 80145,
-  "fresh_vectors": 80145,
-  "bad_norm": 0,
-  "state": "validated",
-  "encoding_policy": {
-    "provider": "gemma_api",
-    "model_id": "embeddinggemma-2",
-    "model_revision": "embeddinggemma-2@created:1791470132",
-    "dimension": 768,
-    "storage_table": "ipc_embeddings_gemma",
-    "normalized": true,
-    "document_template": "title: none | text: {text}",
-    "query_template": "task: search result | query: {text}",
-    "taxonomy_max_tokens": 512,
-    "query_chunk_tokens": 1024,
-    "dtype": "float32",
-    "extra": {
-      "endpoint_host": "192.168.200.29:11511",
-      "normalization": "client_l2"
-    }
-  }
-}
+version https://git-lfs.github.com/spec/v1
+oid sha256:34f61d7be574628e4af11ee3e7a07d4a8add10206b4b4b673a2d1c6349b9ae1d
+size 753
