@@ -57,7 +57,8 @@ is missing.
   the codes in `candidates`.
 - `fallback_reason` (**2.0**, nullable): null exactly when `classifier` is `neighbour_vote`. Otherwise
   `neighbour_vote_disabled` | `no_serving_corpus` | `patent_encoder_unavailable` | `vote_empty` |
-  `vote_below_minimum` | `vote_failed`.
+  `vote_below_minimum` | `vote_failed` (search or vote raised, including a search that returned
+  fewer than `k` neighbours).
 - `field_of_invention`: `{label, mapping_key, mapping_version, additional_labels, rationale}`. The
   label comes from the class of the primary candidate via
   [field_mapping.json](../apps/api/app/services/fields/field_mapping.json) (`H04 → COMMUNICATION`).
@@ -109,10 +110,16 @@ is missing.
   - `first_code` (display code) and `first_code_level` (`subclass` | `maingroup` | `subgroup`):
     chosen top-down, best subclass, then its best main group, then that main group's best code.
   - `first_code_share`: a `vote_share` object; its `subclass` value is the one compared with
-    `provenance.vote_settings.min_vote_share`.
+    `provenance.vote_settings.min_vote_share`. The comparison uses the emitted value, already rounded
+    to 4 decimals: `≥` gives `classifier: "neighbour_vote"`, `<` gives `fallback_reason:
+    "vote_below_minimum"`. A client re-checking the response therefore reaches the same verdict;
+    for example 0.29996 is emitted as 0.3 and passes a 0.3 minimum.
   - `top_codes {subclass[], maingroup[], exact[]}`: each a list of `{display_code, share}`, descending
     share, at most 10 (`MAX_TOP_CODES_PER_LEVEL`).
-  - `neighbour_count`: neighbours that entered the vote (≤ `k`; fewer only if the corpus is smaller).
+  - `neighbour_count`: neighbours that entered the vote, always equal to
+    `provenance.vote_settings.k`. When the search returns fewer than `k` rows (a corpus or index
+    problem), the vote is not computed. The response is then the definition fallback with
+    `fallback_reason: "vote_failed"` and `vote: null`, never a vote over fewer neighbours.
   - `neighbours[]`: the min(10, `neighbour_count`) nearest corpus patents (`MAX_NEIGHBOURS` = 10),
     descending similarity: `{document_id, title|null, similarity, vote_weight, ipc_codes[]}`.
     `similarity` is cosine similarity (PaECTER values are compressed, typically 0.95–0.99), not a

@@ -304,9 +304,11 @@ class VoteResult(_Response):
 
     first_code: str  # display code chosen hierarchically: subclass -> main group -> subgroup
     first_code_level: VoteCodeLevel
-    first_code_share: VoteShare  # subclass is the value compared with vote_settings.min_vote_share
+    # subclass (rounded to 4 decimals) is compared with vote_settings.min_vote_share: >= for the vote, < for
+    # fallback_reason "vote_below_minimum"
+    first_code_share: VoteShare
     top_codes: VoteTopCodes
-    neighbour_count: int = Field(ge=1)  # neighbours that entered the vote (<= vote_settings.k)
+    neighbour_count: int = Field(ge=1)  # neighbours that entered the vote; always == vote_settings.k
     neighbours: list[NeighbourPatent] = Field(max_length=MAX_NEIGHBOURS)  # descending similarity
 
     @model_validator(mode="after")
@@ -338,7 +340,7 @@ class VoteSettings(_Response):
     k: int = Field(ge=1)
     temperature: float = Field(gt=0.0)  # T in exp((s - s1) / T)
     beta: float = Field(ge=0.0, le=1.0)  # weight of secondary labels (main label weighs 1)
-    min_vote_share: float = Field(ge=0.0, le=1.0)  # compared with vote.first_code_share.subclass
+    min_vote_share: float = Field(ge=0.0, le=1.0)  # gate on the rounded vote.first_code_share.subclass (>= passes)
     hnsw_ef_search: int | None = Field(ge=1)  # null when the search is exact (no HNSW index)
 
 
@@ -421,8 +423,29 @@ class ClassifyResponse(_Response):
         p = self.provenance
         if self.vote is not None and (p.patent_encoder is None or p.patent_corpus is None or p.vote_settings is None):
             raise ValueError("provenance.patent_encoder, patent_corpus and vote_settings are required with a vote")
-        if self.vote is not None and p.vote_settings is not None and self.vote.neighbour_count > p.vote_settings.k:
-            raise ValueError("vote.neighbour_count cannot exceed provenance.vote_settings.k")
+        if self.vote is not None and p.vote_settings is not None:
+            # Exactly k neighbours enter every vote: a shorter search result is an error (NeighbourShortfall ->
+            # fallback_reason "vote_failed", vote null), never a smaller vote (ADR-0005 amendment).
+            if self.vote.neighbour_count > p.vote_settings.k:
+                raise ValueError("vote.neighbour_count cannot exceed provenance.vote_settings.k")
+            if self.vote.neighbour_count < p.vote_settings.k:
+                raise ValueError(
+                    "vote.neighbour_count must equal provenance.vote_settings.k (a neighbour shortfall is "
+                    "fallback_reason 'vote_failed' with vote null)"
+                )
+            # Minimum-share gate, on the wire values: the server rounds shares to 4 decimals first, then
+            # compares, so a client re-checking the response reaches the same verdict.
+            share, minimum = self.vote.first_code_share.subclass, p.vote_settings.min_vote_share
+            if share is not None and voted and share < minimum:
+                raise ValueError(
+                    f"classifier 'neighbour_vote' needs vote.first_code_share.subclass ({share}) >= "
+                    f"provenance.vote_settings.min_vote_share ({minimum})"
+                )
+            if share is not None and self.fallback_reason == "vote_below_minimum" and share >= minimum:
+                raise ValueError(
+                    f"fallback_reason 'vote_below_minimum' needs vote.first_code_share.subclass ({share}) < "
+                    f"provenance.vote_settings.min_vote_share ({minimum})"
+                )
         if voted and self.vote is not None:
             # The vote always yields its first code (computed at the deepest level). It leads `candidates`,
             # reported either as itself or as its ancestor at a coarser requested target_level (main group,
