@@ -222,9 +222,18 @@ class WipoConcordance(Mapping[str, list[str]]):
         return targets or None
 
     def resolve(self, code: str) -> ResolvedLabel | None:
-        """``common_ancestor(apply(code))``: what an abolished label should vote for, or None."""
-        targets = self.apply(code)
-        return common_ancestor(targets, self.catalogue) if targets else None
+        """What an abolished label should vote for, or None.
+
+        The common ancestor of ALL its final targets, not only of those in the catalogue: dropping the missing
+        ones first would invent precision (four target main groups with only one in the catalogue would give
+        that one exact code). ``common_ancestor`` then drops levels the catalogue lacks. None when no target is
+        in the catalogue, or the targets share no vote-level ancestor.
+        """
+        if self.apply(code) is None:  # not abolished, or no target in the catalogue
+            return None
+        old = self.old_symbol(code)
+        assert old is not None
+        return common_ancestor(self._final[old], self.catalogue)
 
 
 def common_ancestor(targets: Sequence[str], catalogue: Container[str] | None = None) -> ResolvedLabel | None:

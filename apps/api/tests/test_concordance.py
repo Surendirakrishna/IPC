@@ -122,6 +122,23 @@ def test_input_forms_and_current_symbol_guard(synthetic: WipoConcordance) -> Non
     assert guarded.apply("A98A110") is None and guarded.apply("A98A 1/10") is None
 
 
+def test_resolve_uses_all_targets_even_those_missing_from_the_catalogue() -> None:
+    # Review finding: resolving over only the in-catalogue targets invented precision. A98A 5/00 went to
+    # B98B 5/10 and B98B 6/20; with B98B 6/20 missing from the catalogue the label must still vote for the
+    # subclass only, not for B98B 5/10.
+    catalogue = CATALOGUE - {"B98B 6/20"}
+    conc = WipoConcordance([read_concordance_xml(ED_2023)[1:]], catalogue)
+    assert conc.apply("A98A 5/00") == ["B98B 5/10"]  # apply still lists what is resolvable
+    assert conc.resolve("A98A 5/00") == ResolvedLabel("B98B", None, None)
+    # same main group, one target missing: the main group, not the remaining exact code
+    conc = WipoConcordance([read_concordance_xml(ED_2023)[1:]], CATALOGUE - {"B98B 6/20"})
+    assert conc.apply("A98A 1/20") == ["B98B 6/00", "B98B 6/10"]
+    assert conc.resolve("A98A 1/20") == ResolvedLabel("B98B", "B98B 6/00", None)
+    # no target in the catalogue at all: None
+    conc = WipoConcordance([read_concordance_xml(ED_2023)[1:]], {"B98B"})
+    assert conc.apply("A98A 1/10") is None and conc.resolve("A98A 1/10") is None
+
+
 def test_targets_outside_the_catalogue_are_dropped() -> None:
     conc = WipoConcordance([read_concordance_xml(ED_2023)[1:]], {"B98B", "B98B 6/00", "B98B 6/10"})
     assert conc.apply("A98A 1/20") == ["B98B 6/00", "B98B 6/10"]
