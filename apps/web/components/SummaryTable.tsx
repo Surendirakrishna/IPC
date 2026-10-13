@@ -40,6 +40,15 @@ export function SummaryTable({ result }: { result: ClassifyResponse }) {
           </tr>
         </tbody>
       </table>
+      {/* confidence_text is server-rendered and shown verbatim. "vote share: N%" stays in plain type (it is a
+          number, unlike the italic "confidence: …" texts); this note says what it is, outside the table. */}
+      {result.candidates.some((c) => c.confidence.status === "vote_share_uncalibrated") && (
+        <p className="text-xs text-zinc-600 dark:text-zinc-400" data-testid="vote-share-note">
+          Vote share: the similarity-weighted share of the
+          {result.vote ? ` ${result.vote.neighbour_count}` : ""} most similar patents that carry the code. It is not a
+          calibrated probability, and shares of different codes do not add up to 100%.
+        </p>
+      )}
       <div className="flex items-center gap-3 text-xs">
         <button
           type="button"
