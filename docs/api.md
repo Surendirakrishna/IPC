@@ -16,12 +16,34 @@ Every error has the same shape: `{"error": "<code>", "message": "<text>", "detai
 | `POST /v1/classify` | See below. |
 | `GET /v1/admin/jobs`, `POST /v1/admin/reload-confidence` | Need `Authorization: Bearer $ADMIN_TOKEN`; disabled (404) when it is unset. Import, embedding, index and calibration jobs are CLI-only. |
 
-`checks.neighbour_vote` (in `/ready`) and `neighbour_vote` (in `/v1/taxonomy/status`):
-`{enabled: bool, state, patent_encoder, patent_corpus, vote_settings}`. `state` is `serving`,
-`disabled`, `no_serving_corpus` or `patent_encoder_unavailable` (not loaded, or its revision differs
-from the corpus's). `patent_encoder`, `patent_corpus` and `vote_settings` have the shapes of the
-`provenance` fields of the same names below, or null. `patent_corpus` additionally carries `state`
-(`loading` | `embedded` | `validated` | `failed`) here.
+`checks.neighbour_vote` (in `/ready`) and `neighbour_vote` (in `/v1/taxonomy/status`) have the same
+shape, from one builder. It never changes `ready`. Every key is always present:
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `enabled` | bool | `NEIGHBOUR_VOTE_ENABLED`. |
+| `state` | string | `serving` \| `disabled` \| `no_serving_corpus` \| `patent_encoder_unavailable` \| `corpus_too_small` \| `unknown`. See below. |
+| `degraded` | bool | `false` only for `serving` and `disabled`. When `true`, `/v1/classify` answers with the definition fallback. |
+| `reason` | string \| null | Free-text, human-readable explanation, for display and logs. Never parse it. Null only when `state` is `serving`. The wording may change, and new reasons (for example the encoder still loading) need no contract change. |
+| `patent_encoder` | `{model_id, model_revision}` \| null | The loaded patent encoder; null while it is not loaded. |
+| `patent_encoder_error` | string \| null | The encoder's load error, reported whatever the `state`; null when there was none. |
+| `patent_corpus` | `{corpus_id, source, document_count, labels_ipc_edition\|null, state}` \| null | The serving corpus once one is found. Present under `serving`, `patent_encoder_unavailable` and `corpus_too_small`; null under `disabled`, `no_serving_corpus` and `unknown`. Same fields as `provenance.patent_corpus`, plus the corpus lifecycle `state` (`loading` \| `embedded` \| `validated` \| `failed`; a serving corpus is `validated`). |
+| `vote_settings` | `{k, temperature, beta, min_vote_share, hnsw_ef_search\|null}` \| null | As in `provenance.vote_settings`; null only when `disabled`. |
+
+`state` values, checked in the pipeline's order so that `state` names the same cause a response
+reports as `fallback_reason`:
+
+| `state` | `degraded` | Meaning | Matching `fallback_reason` |
+| --- | --- | --- | --- |
+| `serving` | false | The vote will run | — |
+| `disabled` | false | Operator turned the vote off | `neighbour_vote_disabled` |
+| `no_serving_corpus` | true | No validated corpus is serving, or the patent tables don't exist (migration 0004 not applied) | `no_serving_corpus` |
+| `patent_encoder_unavailable` | true | PaECTER not loaded (including while it loads), or its model/revision differs from the corpus's | `patent_encoder_unavailable` |
+| `corpus_too_small` | true | `document_count < k`: every search would come back short | `vote_failed` |
+| `unknown` | true | The serving corpus could not be read (database not configured or unreachable) | depends on the request |
+
+Clients should decide on `degraded` and show `reason`, and use `state` only for logs and metrics.
+Treat an unrecognised `state` according to `degraded`.
 
 ## POST /v1/classify
 
