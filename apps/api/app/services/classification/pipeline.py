@@ -35,7 +35,9 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import numpy as np
+import psycopg
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.config import Settings
@@ -90,7 +92,12 @@ from app.services.ingestion.wipo import display_symbol
 from app.services.retrieval.expansion import expand
 from app.services.retrieval.fusion import FusedCandidate, ViewHits, fuse, vote_subclasses
 from app.services.retrieval.keyword import build_websearch_query, extract_terms, keyword_search
-from app.services.retrieval.patent_search import NeighbourShortfall, PatentNeighbour, search_patents
+from app.services.retrieval.patent_search import (
+    NeighbourShortfall,
+    PatentNeighbour,
+    PatentSearchError,
+    search_patents,
+)
 from app.services.retrieval.query_views import QueryView, build_views, regex_token_offsets
 from app.services.retrieval.vector import vector_search
 
@@ -136,6 +143,16 @@ class InputRejected(ValueError):
         super().__init__(message)
         self.code = code
         self.details = details
+
+
+class _EncoderFailed(RuntimeError):
+    """The patent encoder raised at run time (CUDA, out of memory, PaecterError)."""
+
+
+# What a vote attempt may fail with and still answer with the definition fallback (fallback_reason "vote_failed").
+VOTE_RUNTIME_ERRORS: tuple[type[BaseException], ...] = (
+    SQLAlchemyError, psycopg.Error, PatentSearchError, _EncoderFailed,
+)  # fmt: skip
 
 
 class _VoteUnusable(RuntimeError):
@@ -660,7 +677,10 @@ class ClassificationPipeline:
                         f"{corpus.encoder_model_revision}, but the loaded encoder is {enc.model_id}@{enc.revision}; "
                         "codes come from definition matching.")
                 t = time.perf_counter()
-                query_vector = enc.encode([patent_text(req.title, req.abstract)])[0]
+                try:
+                    query_vector = enc.encode([patent_text(req.title, req.abstract)])[0]
+                except (RuntimeError, MemoryError) as exc:  # PaecterError, CUDA / torch errors, out of memory
+                    raise _EncoderFailed(f"{type(exc).__name__}: {exc}") from exc
                 timings["patent_encode"] = (time.perf_counter() - t) * 1000
                 t = time.perf_counter()
                 neighbours = self.patent_store.search(session, str(corpus.corpus_id), query_vector, k,
@@ -673,7 +693,9 @@ class ClassificationPipeline:
                 timings["vote"] = (time.perf_counter() - t) * 1000
         except NeighbourShortfall as exc:
             return att.fail("vote_failed", f"Neighbour vote failed: {exc}. Codes come from definition matching.")
-        except Exception as exc:  # noqa: BLE001 - any search/encode failure degrades to the fallback, with the reason
+        except VOTE_RUNTIME_ERRORS as exc:
+            # Database, patent-search and encoder failures degrade to the fallback, with the reason. Anything else
+            # (TypeError, KeyError, ...) is a bug and propagates, as it does on the definition path.
             log.exception("neighbour vote failed")
             return att.fail("vote_failed", f"Neighbour vote failed ({type(exc).__name__}: {str(exc)[:300]}); codes "
                                            "come from definition matching.")
