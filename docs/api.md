@@ -76,9 +76,22 @@ is missing.
   | `unsupported_input_mode` | `confidence: not calibrated for this input mode` |
 
 - `candidates[]`, in selection order (vote order when `classifier` is `neighbour_vote`). With the
-  neighbour vote the list is never empty, and `candidates[0].display_code == vote.first_code`. The one
-  exception is when an unconditional precedence rule demoted the first code: it then appears in
-  `alternatives` and the supported code it yields to leads. Each candidate has:
+  neighbour vote the list is never empty, and `candidates[0]` is the vote's first code reported at
+  the requested `target_level`. The vote always runs at the deepest level, so `vote.first_code` does
+  not depend on `target_level`. When `target_level` is coarser than `vote.first_code_level`,
+  `candidates[0]` is that code's ancestor at the candidate's `level`, written as a catalogue display
+  code. For `vote.first_code` `H04L 9/08`:
+
+  | candidate `level` | `candidates[0].display_code` |
+  | --- | --- |
+  | `subgroup` | `H04L 9/08` |
+  | `maingroup` | `H04L 9/00` |
+  | `subclass` | `H04L` |
+  | `class` | `H04` |
+
+  The one exception is when an unconditional precedence rule demoted that code. It then appears in
+  `alternatives` (as itself or as the same ancestor), and the supported code it yields to leads.
+  Each candidate has:
   - `code`, `display_code`, `title`, `original_title` (nullable) and `level`;
   - `confidence {score|null, status, calibrator_id|null, interpretation|null, detail|null}`;
   - `vote_share {subclass|null, maingroup|null, exact|null}` (**2.0**), see below;
@@ -140,12 +153,14 @@ Patents carry several codes, so shares of different codes do not sum to 1.
 | `exact` | exactly this code (a main group counts neighbours labelled with that main group itself) | as above, or the candidate is a subclass |
 
 For one code, `subclass ≥ maingroup ≥ exact`. `0.0` is a real share. Values are rounded to 4 decimals.
+A `class` candidate (only with `target_level: "class"`) is coarser than every level, so all three are
+null; its class-level share (neighbours carrying any code in the class) is in `confidence.score`.
 
 `confidence.score` is a **calibrated probability only when `confidence.status` is `calibrated`**
 (`calibrator_id` names the calibrator, which is tied to the encoder and corpus through the
 fingerprint). With `vote_share_uncalibrated`, `score` is the raw vote share at the candidate's own
 level (`subclass` → `vote_share.subclass`, `maingroup` → `vote_share.maingroup`, `subgroup` →
-`vote_share.exact`) and `calibrator_id` is null. With the neighbour vote, the status is always
+`vote_share.exact`, `class` → the class-level share) and `calibrator_id` is null. With the neighbour vote, the status is always
 `calibrated` or `vote_share_uncalibrated` and `score` is never null. With the definition fallback,
 `score` is non-null only with an active, compatible, evaluated calibrator; the other statuses are
 `not_calibrated`, `incompatible_artifact` and `unsupported_input_mode` (score null). Retrieval

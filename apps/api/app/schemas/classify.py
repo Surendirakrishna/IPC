@@ -106,7 +106,8 @@ class Confidence(_Response):
 
     status == "vote_share_uncalibrated": score is the raw neighbour vote share of the candidate at its
     own level (subclass -> vote_share.subclass, maingroup -> vote_share.maingroup, subgroup ->
-    vote_share.exact), calibrator_id is null. Every other non-calibrated status has score null.
+    vote_share.exact; class -> the class-level share, which VoteShare cannot hold), calibrator_id is null.
+    Every other non-calibrated status has score null.
     """
 
     score: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -134,7 +135,8 @@ class VoteShare(_Response):
     itself). Multi-label, so shares of different codes do not sum to 1; for one code
     subclass >= maingroup >= exact. Null means "not applicable": no vote shares are reported (all three
     null whenever classifier == "definition_fallback"), or the code is coarser than the level (a
-    subclass candidate has maingroup = exact = null). 0.0 is a real share, not "missing".
+    subclass candidate has maingroup = exact = null; a class candidate, reported when target_level="class",
+    has all three null and its class-level share only in confidence.score). 0.0 is a real share.
     """
 
     subclass: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -313,6 +315,8 @@ class VoteResult(_Response):
             raise ValueError("vote.first_code_share.subclass is required")
         if own_level_share(self.first_code_level, self.first_code_share) is None:
             raise ValueError(f"vote.first_code_share needs a share at first_code_level ({self.first_code_level})")
+        if not _display_matches_level(self.first_code, self.first_code_level):
+            raise ValueError(f"vote.first_code {self.first_code!r} is not a {self.first_code_level} display code")
         if len(self.neighbours) > self.neighbour_count:
             raise ValueError("vote.neighbours cannot exceed vote.neighbour_count")
         return self
@@ -420,19 +424,30 @@ class ClassifyResponse(_Response):
         if self.vote is not None and p.vote_settings is not None and self.vote.neighbour_count > p.vote_settings.k:
             raise ValueError("vote.neighbour_count cannot exceed provenance.vote_settings.k")
         if voted and self.vote is not None:
-            # The vote always yields its first code. It leads `candidates` unless an unconditional precedence
-            # rule demoted it (ADR-0004), in which case it is in `alternatives` and a supported code leads.
+            # The vote always yields its first code (computed at the deepest level). It leads `candidates`,
+            # reported either as itself or as its ancestor at a coarser requested target_level (main group,
+            # subclass, class). Exception: an unconditional precedence rule demoted it (ADR-0004); then it
+            # (or that ancestor) is in `alternatives` and a supported code leads.
             if not self.candidates:
                 raise ValueError("candidates must not be empty when classifier is 'neighbour_vote'")
-            first = self.vote.first_code
-            if self.candidates[0].display_code != first and all(a.display_code != first for a in self.alternatives):
+            first, first_level = self.vote.first_code, self.vote.first_code_level
+            lead = self.candidates[0]
+            if not is_first_code_or_ancestor(lead.display_code, lead.level, first, first_level) and not any(
+                is_first_code_or_ancestor(a.display_code, a.level, first, first_level) for a in self.alternatives
+            ):
                 raise ValueError(
-                    f"vote.first_code {first} must be candidates[0].display_code, or be in alternatives "
-                    "when a precedence rule demoted it"
+                    f"candidates[0] ({lead.display_code}, {lead.level}) must be vote.first_code {first} or its "
+                    "ancestor at the candidate's level, or that code must be in alternatives when a precedence "
+                    "rule demoted it"
                 )
         for c in self.candidates:
             if voted:
-                if c.vote_share.subclass is None:
+                if c.level == "class":
+                    # A class is coarser than every VoteShare level: all three are null (not applicable), and
+                    # confidence.score carries the class-level share.
+                    if not c.vote_share.is_empty():
+                        raise ValueError(f"candidate {c.display_code}: a class candidate has an all-null vote_share")
+                elif c.vote_share.subclass is None:
                     raise ValueError(f"candidate {c.display_code}: vote_share.subclass is required with the vote")
                 if c.confidence.status not in _SCORE_STATUSES:
                     raise ValueError(
@@ -446,6 +461,8 @@ class ClassifyResponse(_Response):
                     raise ValueError(
                         "confidence.status 'vote_share_uncalibrated' is only valid with the neighbour vote"
                     )
+                if c.level == "class":
+                    continue  # score is the class-level share; VoteShare has no class level to compare with
                 own = own_level_share(c.level, c.vote_share)
                 if own is None or abs(own - (c.confidence.score or 0.0)) > 1e-9:
                     raise ValueError(
@@ -463,6 +480,35 @@ def own_level_share(level: str, share: VoteShare) -> float | None:
     """The vote share that is a candidate's raw score: subclass -> subclass, maingroup -> maingroup,
     subgroup -> exact."""
     return {"subclass": share.subclass, "maingroup": share.maingroup, "subgroup": share.exact}.get(level)
+
+
+def _display_matches_level(display: str, level: str) -> bool:
+    """Shape of catalogue display codes (ingestion.wipo.display_symbol): class "H04", subclass "H04L",
+    main group "H04L 9/00", subgroup "H04L 9/08"."""
+    if level == "class":
+        return len(display) == 3
+    if level == "subclass":
+        return len(display) == 4
+    if " " not in display or "/" not in display:
+        return False
+    return display.endswith("/00") if level == "maingroup" else level == "subgroup" and not display.endswith("/00")
+
+
+def vote_code_ancestors(first_code: str, first_code_level: str) -> dict[str, str]:
+    """Display codes of the vote's first code's strictly coarser ancestors, keyed by catalogue level."""
+    out = {"class": first_code[:3]}
+    if first_code_level in ("maingroup", "subgroup"):
+        out["subclass"] = first_code[:4]
+    if first_code_level == "subgroup":
+        out["maingroup"] = first_code.split("/")[0] + "/00"
+    return out
+
+
+def is_first_code_or_ancestor(display: str, level: str, first_code: str, first_code_level: str) -> bool:
+    """True when (display, level) is the vote's first code, or its ancestor at `level` (coarser target_level)."""
+    if display == first_code:
+        return True
+    return vote_code_ancestors(first_code, first_code_level).get(level) == display
 
 
 class ErrorBody(BaseModel):
