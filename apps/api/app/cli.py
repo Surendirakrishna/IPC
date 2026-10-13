@@ -258,6 +258,18 @@ class PatentLockBusy(RuntimeError):
     """Another ipc command holds the advisory lock for this corpus (or for serving changes)."""
 
 
+class PatentResumeRefused(RuntimeError):
+    """load-patents would build on a corpus loaded with other ingest parameters."""
+
+
+class PrecomputedTextMismatch(RuntimeError):
+    """Too many precomputed vectors were computed from text that differs from the stored documents."""
+
+
+class IngestConcordanceMismatch(RuntimeError):
+    """The concordance lists loaded are not the files the ingest parameters recorded (should not happen)."""
+
+
 def _patent_errors() -> tuple[type[BaseException], ...]:
     """Expected failures of the patent commands: reported as one clear line and exit code 1. Anything else is a
     bug and keeps its traceback."""
@@ -272,7 +284,7 @@ def _patent_errors() -> tuple[type[BaseException], ...]:
     from app.services.patents.ingest import IngestError
     from app.services.patents.sources.uspto_odp import UsptoReaderError
 
-    return (PatentLockBusy, PatentCorpusError, DatabaseNotConfigured, PaecterError, ConcordanceError,
+    return (PatentLockBusy, PatentResumeRefused, PrecomputedTextMismatch, IngestConcordanceMismatch, PatentCorpusError, DatabaseNotConfigured, PaecterError, ConcordanceError,
             PatentEmbedError, PatentIndexError, IngestError, UsptoReaderError, psycopg.Error, FileNotFoundError,
             ValueError, typer.BadParameter)  # fmt: skip
 
@@ -445,11 +457,44 @@ def _corpus_row(conn: Any, corpus_id: str) -> Any:
         conn.rollback()
 
 
+def _concordance_plan(enabled: bool) -> tuple[list[str], str]:
+    """(WIPO list file names an ingest would apply, note), from the file names alone: no loading. Same names, in
+    the same order, as ``load_concordance(directory).sources``."""
+    from app.services.patents.concordance import FILE_GLOB
+
+    if not enabled:
+        return [], "disabled (--no-concordance)"
+    directory = get_settings().source_dir
+    names = [p.name for p in sorted(directory.glob(FILE_GLOB))]
+    if not names:
+        return [], f"not applied: no {FILE_GLOB} in {directory}"
+    return names, f"applied: {len(names)} WIPO concordance list(s) from {directory}"
+
+
 def _ingest_parameters(source: str, years: list[int], limit: int | None, sample: int | None, seed: int,
-                       holdout: int, concordance: bool) -> dict:  # fmt: skip
-    """What a completed ingest is compared on when ``load-patents`` decides whether to resume past it."""
+                       holdout: int, *, concordance: bool, data_dir: Path | None,
+                       label_ipc_edition: str | None) -> dict:  # fmt: skip
+    """Everything a completed ingest is compared on before ``load-patents`` resumes past it: the source selection,
+    the sampling, the labels' edition and which concordance lists would be applied."""
+    sources, _ = _concordance_plan(concordance)
+    hupd_dir = str(Path(data_dir or get_settings().hupd_data_dir)) if source == "hupd" else None
     return {"source": source, "years": years, "limit": limit, "sample": sample, "seed": seed, "holdout": holdout,
-            "concordance": concordance}  # fmt: skip
+            "data_dir": hupd_dir, "label_ipc_edition": label_ipc_edition, "concordance_applied": bool(sources),
+            "concordance_sources": sources}  # fmt: skip
+
+
+def _live_document_count(conn: Any, corpus_id: str) -> int:
+    n = conn.execute("SELECT count(*) FROM patent_documents WHERE corpus_id = %s", [corpus_id]).fetchone()[0]
+    conn.rollback()
+    return int(n)
+
+
+def _parameter_diff(last: dict | None, parameters: dict) -> str:
+    if not last or not last.get("completed"):
+        return "no completed ingest is recorded for this corpus"
+    old = last.get("parameters") or {}
+    keys = sorted(k for k in set(old) | set(parameters) if old.get(k) != parameters.get(k))
+    return "; ".join(f"{k}: {old.get(k)!r} -> {parameters.get(k)!r}" for k in keys)
 
 
 def _ingest_step(conn: Any, corpus_id: str, *, source: str, years: list[int], limit: int | None, sample: int | None,
@@ -458,12 +503,20 @@ def _ingest_step(conn: Any, corpus_id: str, *, source: str, years: list[int], li
     from app.services.patents.ingest import HoldoutLeak, ingest
 
     s = get_settings()
+    parameters = _ingest_parameters(source, years, limit, sample, seed, holdout, concordance=concordance,
+                                    data_dir=data_dir, label_ipc_edition=label_ipc_edition)  # fmt: skip
+    # Written before any document: a run that dies mid-ingest leaves "completed": false, never the previous run's
+    # completed manifest, so a resume cannot mistake a mixed corpus for a clean one.
+    _write_patent_manifest("ingest", corpus_id, {"corpus_id": corpus_id, "completed": False, "parameters": parameters,
+                                                 "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})  # fmt: skip
     version = _active_version(conn)
     conn.rollback()
     catalogue = _catalogue(conn, version)
     conc, conc_note = _load_concordance_if_present(concordance, catalogue)
     reader, source_parameters = _patent_reader(source, years, limit, data_dir)
-    parameters = _ingest_parameters(source, years, limit, sample, seed, holdout, concordance)
+    if list(getattr(conc, "sources", None) or []) != parameters["concordance_sources"]:
+        raise IngestConcordanceMismatch(f"loaded concordance lists {getattr(conc, 'sources', None)} differ from the "
+                                        f"files found {parameters['concordance_sources']}")  # fmt: skip
     extra = {"concordance_applied": conc is not None, "concordance_note": conc_note, "parameters": parameters}
     try:
         manifest = ingest(
@@ -482,19 +535,21 @@ def _ingest_step(conn: Any, corpus_id: str, *, source: str, years: list[int], li
 
 
 def _patent_encoder(model_path: Path | None) -> Any:
-    from app.runtime import patent_encoder_local_path
-    from app.services.embeddings.paecter import PaecterEncoder
+    """PaECTER from --model-path, else PATENT_ENCODER_LOCAL_PATH, else the HF cache, else a download bounded by
+    PATENT_ENCODER_DOWNLOAD_TIMEOUT_S (``PatentEncoderUnavailable``, a PaecterError: one clear line, exit 1)."""
+    from app.runtime import load_patent_encoder
 
-    s = get_settings()
-    return PaecterEncoder.load(local_path=model_path or patent_encoder_local_path(s),
-                               model_id=s.patent_encoder_model_id, revision=s.patent_encoder_model_revision,
-                               device=s.embedding_device)  # fmt: skip
+    return load_patent_encoder(get_settings(), model_path)
 
 
 def _embed_step(conn: Any, corpus_id: str, *, batch: int, from_npy: Path | None, ids: Path | None,
-                model_path: Path | None) -> dict:  # fmt: skip
+                model_path: Path | None, max_text_mismatch: float = 0.01) -> dict:  # fmt: skip
     """Import precomputed vectors (if given), then embed whatever still lacks a vector with PaECTER, then finalize.
-    Both services skip documents that already have a vector, so a re-run resumes."""
+    Both services skip documents that already have a vector, so a re-run resumes.
+
+    If more than ``max_text_mismatch`` of the corpus's documents were skipped by the import because their text
+    differs from the text the vectors were computed from, stop (``PrecomputedTextMismatch``) instead of quietly
+    re-embedding them on the GPU: usually the id list belongs to another corpus or sample."""
     from app.db.patents import CorpusNotFound
     from app.services.embeddings.paecter import PatentEncodingPolicy
     from app.services.patents.embed import (
@@ -510,10 +565,25 @@ def _embed_step(conn: Any, corpus_id: str, *, batch: int, from_npy: Path | None,
     t0 = time.perf_counter()
     store = DbEmbeddingStore(conn)
     out: dict[str, Any] = {"corpus_id": corpus_id, "from_npy": str(from_npy) if from_npy else None,
-                           "ids": str(ids) if ids else None, "batch": batch}  # fmt: skip
+                           "ids": str(ids) if ids else None, "batch": batch, "imported": None,
+                           "skipped_text_mismatch": None, "text_checked": None}  # fmt: skip
     if from_npy is not None:
         src = PrecomputedSource.from_directory(from_npy, ids, with_texts=True)
-        out["import"] = import_precomputed(store, corpus_id, src, batch_size=batch).as_dict()
+        report = import_precomputed(store, corpus_id, src, batch_size=batch).as_dict()
+        out["import"] = report
+        out.update(imported=report.get("imported"), skipped_text_mismatch=report.get("skipped_text_mismatch"),
+                   text_checked=report.get("text_checked"))  # fmt: skip
+        documents, embedded = store.counts(corpus_id)
+        mismatched = int(report.get("skipped_text_mismatch") or 0)
+        if documents and mismatched > max_text_mismatch * documents:
+            out.update(documents=documents, embedded=embedded, state=getattr(store.corpus(corpus_id), "state", None),
+                       error="text mismatch above threshold", seconds=round(time.perf_counter() - t0, 1))
+            _write_patent_manifest("embed", corpus_id, out)
+            raise PrecomputedTextMismatch(
+                f"{mismatched} of {documents} documents ({100 * mismatched / documents:.2f}%) were skipped because their "
+                f"text differs from the text the precomputed vectors were computed from (threshold "
+                f"{100 * max_text_mismatch:g}%). Not re-embedding them on the GPU: check that --ids belongs to this "
+                "corpus (same source, seed and sample), or pass --max-text-mismatch 1 to embed them with PaECTER.")
     corpus = store.corpus(corpus_id)
     if corpus is None:
         raise CorpusNotFound(f"corpus {corpus_id!r} not found (run ingest-patents first)")
@@ -550,18 +620,33 @@ def _validate_step(conn: Any, corpus_id: str, *, probes: int, min_recall: float,
     return manifest
 
 
-def _ingest_done(conn: Any, corpus_id: str, parameters: dict) -> str | None:
-    """Why a completed ingest can be skipped on a re-run (same parameters, corpus still as it left it), or None."""
+def _ingest_decision(conn: Any, corpus_id: str, parameters: dict) -> tuple[str, str]:
+    """("run" | "skip" | "refuse", why) for the ingest step of a ``load-patents`` re-run.
+
+    - no corpus: run;
+    - embedded / validated: skip only if the last ingest manifest is completed with exactly these parameters;
+      otherwise refuse, so a smoke load (or one with another sample, source or concordance) never passes for the
+      requested load;
+    - loading (or failed): skip only if the last manifest is completed with these parameters **and** the live
+      document count equals the count it recorded; otherwise run (the upsert is idempotent).
+    """
     corpus = _corpus_row(conn, corpus_id)
     if corpus is None:
-        return None
-    if corpus.state in ("embedded", "validated"):
-        return f"corpus is {corpus.state}"
+        return "run", "new corpus"
     last = _read_patent_manifest("ingest", corpus_id)
-    if (corpus.state == "loading" and last and last.get("completed") and last.get("parameters") == parameters
-            and last.get("corpus_document_count") == corpus.document_count):  # fmt: skip
-        return f"a completed ingest with these parameters left {corpus.document_count} documents"
-    return None
+    same = bool(last and last.get("completed") and last.get("parameters") == parameters)
+    if corpus.state in ("embedded", "validated"):
+        if same:
+            return "skip", f"corpus is {corpus.state} and its last completed ingest had these parameters"
+        return "refuse", (f"corpus {corpus_id!r} is {corpus.state}, but these parameters differ from the last "
+                          f"completed ingest ({_parameter_diff(last, parameters)}); use --reingest or a new corpus id")
+    if same:
+        live = _live_document_count(conn, corpus_id)
+        if last.get("corpus_document_count") == live:  # type: ignore[union-attr]
+            return "skip", f"a completed ingest with these parameters left {live} documents"
+        return "run", (f"the corpus holds {live} documents, the last completed ingest left "
+                       f"{last.get('corpus_document_count')}")  # type: ignore[union-attr]
+    return "run", _parameter_diff(last, parameters)
 
 
 # Shared options.
@@ -589,6 +674,9 @@ MwmOpt = Annotated[str | None, typer.Option("--maintenance-work-mem", help="e.g.
 ProbesOpt = Annotated[int, typer.Option("--probes", min=1, help="Recall probes")]
 RecallOpt = Annotated[float, typer.Option("--min-recall", min=0.0, max=1.0, help="Minimum mean recall@k")]
 KOpt = Annotated[int | None, typer.Option("--k", min=1, help="Neighbours per probe (default NEIGHBOUR_K)")]
+MismatchOpt = Annotated[float, typer.Option(
+    "--max-text-mismatch", min=0.0, max=1.0,
+    help="Largest fraction of documents --from-npy may skip for a text mismatch before stopping (default 0.01)")]
 
 
 @app.command("ingest-patents")
@@ -627,10 +715,12 @@ def embed_patents(
     from_npy: FromNpyOpt = None,
     ids: IdsOpt = None,
     model_path: ModelPathOpt = None,
+    max_text_mismatch: MismatchOpt = 0.01,
 ) -> None:
     """Fill the corpus's vectors (resumable): import precomputed shards if given, embed the rest with PaECTER."""
     with _patent_errors_reported(), _patent_job(corpus) as conn:
-        result = _embed_step(conn, corpus, batch=batch, from_npy=from_npy, ids=ids, model_path=model_path)
+        result = _embed_step(conn, corpus, batch=batch, from_npy=from_npy, ids=ids, model_path=model_path,
+                             max_text_mismatch=max_text_mismatch)  # fmt: skip
     _echo(result)
     if result["state"] != "embedded":
         _fail(f"corpus {corpus!r} is {result['state']!r}: {result['embedded']} of {result['documents']} documents "
@@ -720,7 +810,9 @@ def load_patents(
     maintenance_work_mem: MwmOpt = None,
     probes: ProbesOpt = 200,
     min_recall: RecallOpt = 0.95,
-    reingest: Annotated[bool, typer.Option("--reingest", help="Run ingest even if a completed one can be skipped")] = False,
+    max_text_mismatch: MismatchOpt = 0.01,
+    reingest: Annotated[bool, typer.Option(
+        "--reingest", help="Run ingest even if a completed one could be skipped, or its parameters differ")] = False,
 ) -> None:
     """Ingest, embed, index and validate one corpus, in order; stop at the first failure. Re-run to resume.
 
@@ -733,7 +825,8 @@ def load_patents(
         raise typer.BadParameter("--from-npy and --ids go together (the shards and their id list)")
     if source == "uspto-odp":
         typer.echo(USPTO_UNVERIFIED_WARNING, err=True)
-    parameters = _ingest_parameters(source, year_list, limit, sample, seed, holdout, concordance)
+    parameters = _ingest_parameters(source, year_list, limit, sample, seed, holdout, concordance=concordance,
+                                    data_dir=data_dir, label_ipc_edition=label_ipc_edition)  # fmt: skip
     steps: list[dict[str, Any]] = []
     summary = {"corpus_id": corpus, "source": source, "years": year_list, "steps": steps}
 
@@ -751,15 +844,19 @@ def load_patents(
         return result
 
     with _patent_errors_reported(), _patent_job(corpus) as conn:
+        decision, why = ("run", "--reingest") if reingest else _ingest_decision(conn, corpus, parameters)
+        if decision == "refuse":
+            steps.append({"step": "ingest", "status": "refused", "why": why})
+            _echo(summary)
+            raise PatentResumeRefused(why)
         start = _corpus_row(conn, corpus)
-        if start is not None and start.state == "validated":
-            steps += [{"step": n, "status": "skipped", "why": "corpus is already validated"} for n in LOAD_STEPS]
+        if decision == "skip" and start is not None and start.state == "validated":
+            steps += [{"step": n, "status": "skipped", "why": f"corpus is already validated ({why})"} for n in LOAD_STEPS]
             summary["next"] = f"ipc activate-patent-corpus --corpus {corpus}"
             _echo(summary)
             return
-        skip_ingest = None if reingest else _ingest_done(conn, corpus, parameters)
-        if skip_ingest:
-            steps.append({"step": "ingest", "status": "skipped", "why": skip_ingest})
+        if decision == "skip":
+            steps.append({"step": "ingest", "status": "skipped", "why": why})
         else:
             run("ingest", lambda: _ingest_step(
                 conn, corpus, source=source, years=year_list, limit=limit, sample=sample, seed=seed, holdout=holdout,
@@ -772,8 +869,10 @@ def load_patents(
             steps.append({"step": "embed", "status": "skipped", "why": "corpus is embedded"})
         else:
             embedded = run("embed", lambda: _embed_step(conn, corpus, batch=batch, from_npy=from_npy, ids=ids,
-                                                        model_path=model_path),
-                           lambda r: {"documents": r["documents"], "embedded": r["embedded"], "state": r["state"]})
+                                                        model_path=model_path, max_text_mismatch=max_text_mismatch),
+                           lambda r: {"documents": r["documents"], "embedded": r["embedded"], "state": r["state"],
+                                      "imported": r["imported"], "skipped_text_mismatch": r["skipped_text_mismatch"],
+                                      "text_checked": r["text_checked"]})  # fmt: skip
             if embedded["state"] != "embedded":
                 steps[-1]["status"] = "failed"
                 _echo(summary)

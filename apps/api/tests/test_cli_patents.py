@@ -78,6 +78,9 @@ class FakeConn:
             return _Res([(VERSION,)])
         if "FROM ipc_records" in query:
             return _Res([(c,) for c in ("H04L", "H04L 9/00", "H04L 9/08")])
+        if "SELECT count(*) FROM patent_documents WHERE corpus_id" in query:
+            w.live_counts += 1
+            return _Res([(w.documents.get(params[0], 0),)])
         if "to_regclass('public.patent_corpora')" in query:
             return _Res([(True,)])
         if "FROM patent_corpora" in query:
@@ -109,8 +112,9 @@ class World:
     fail: dict[str, BaseException] = field(default_factory=dict)  # service name -> exception to raise
     stored: int = 5  # documents an ingest writes
     validate_passes: bool = True
-    imported: int | None = None  # documents import_precomputed gives a vector (None: all)
+    text_mismatch: int = 0  # documents import_precomputed skips because their text differs
     encoder_loads: list[Any] = field(default_factory=list)
+    live_counts: int = 0  # live count(*) queries cli.py made
 
     def names(self) -> list[str]:
         return [n for n, _ in self.calls]
@@ -144,7 +148,8 @@ def settings(tmp_path: Path) -> Settings:
     source.mkdir()
     (source / "wipo_ipc_concordance_20260101.zip").write_bytes(b"")  # presence is what the CLI checks
     return Settings(_env_file=None, manifests_dir=tmp_path / "manifests", source_dir=source,
-                    hupd_data_dir=tmp_path / "hupd", uspto_odp_api_key="test-key-not-real")  # fmt: skip
+                    hupd_data_dir=tmp_path / "hupd", uspto_odp_api_key="test-key-not-real",
+                    patent_encoder_local_path=tmp_path / "paecter")  # fmt: skip
 
 
 @pytest.fixture
@@ -168,7 +173,8 @@ def world(monkeypatch: pytest.MonkeyPatch, settings: Settings) -> World:
 
     def load_concordance(path: Any, catalogue: Any = None) -> Any:
         w.calls.append(("load_concordance", {"path": path, "catalogue": catalogue}))
-        return SimpleNamespace(sources=["wipo_ipc_concordance_20260101.zip"], catalogue=catalogue)
+        names = [p.name for p in sorted(Path(path).glob("wipo_ipc_concordance_*.zip"))]  # as the real loader does
+        return SimpleNamespace(sources=names, catalogue=catalogue)
 
     monkeypatch.setattr("app.services.patents.concordance.load_concordance", load_concordance)
 
@@ -176,6 +182,10 @@ def world(monkeypatch: pytest.MonkeyPatch, settings: Settings) -> World:
     def ingest(reader: Any, corpus_id: str, catalogue: Any, **kw: Any) -> dict[str, Any]:
         w.calls.append(("ingest", {"reader": reader, "corpus_id": corpus_id, "catalogue": catalogue, **kw}))
         w._maybe_fail("ingest")
+        if "ingest_after_write" in w.fail:  # a crash after some documents were written
+            w.corpora.setdefault(corpus_id, _corpus(corpus_id, "loading"))
+            w.documents[corpus_id] = w.documents.get(corpus_id, 0) + 3
+            w._maybe_fail("ingest_after_write")
         w.corpora.setdefault(corpus_id, _corpus(corpus_id, "loading"))
         w.documents[corpus_id] = w.stored
         w.set_state(corpus_id, "loading", w.stored)
@@ -206,9 +216,9 @@ def world(monkeypatch: pytest.MonkeyPatch, settings: Settings) -> World:
     def import_precomputed(store: Any, corpus_id: str, src: Any, *, batch_size: int) -> Any:
         w.calls.append(("import_precomputed", {"corpus_id": corpus_id, "source": src, "batch_size": batch_size}))
         n = w.documents.get(corpus_id, 0)
-        w.embedded[corpus_id] = n if w.imported is None else w.imported
+        w.embedded[corpus_id] = n - w.text_mismatch
         finish(corpus_id)
-        return rep(corpus_id, imported=w.embedded[corpus_id])
+        return rep(corpus_id, imported=w.embedded[corpus_id], skipped_text_mismatch=w.text_mismatch, text_checked=True)
 
     def finalize_corpus(store: Any, corpus_id: str, policy: Any) -> Any:
         w.calls.append(("finalize_corpus", {"corpus_id": corpus_id, "policy": policy}))
@@ -301,7 +311,9 @@ def test_ingest_hupd_parses_arguments_and_writes_the_manifest(world: World, sett
     assert m["concordance_applied"] is True and m["concordance_note"].startswith("applied: 1 WIPO")
     assert m["completed"] is True and m["holdout_ids"] == ["x1", "x2"]
     assert m["parameters"] == {"source": "hupd", "years": [2017], "limit": None, "sample": 4, "seed": 7,
-                               "holdout": 2, "concordance": True}
+                               "holdout": 2, "data_dir": str(settings.hupd_data_dir), "label_ipc_edition": "2017.01",
+                               "concordance_applied": True,
+                               "concordance_sources": ["wipo_ipc_concordance_20260101.zip"]}  # fmt: skip
     out = json.loads(r.stdout)
     assert out["holdout_ids"] == 2  # a count on screen; the ids are in the manifest
 
@@ -409,15 +421,38 @@ def test_embed_encodes_pending_documents_and_is_resumable(world: World, settings
 def test_embed_from_npy_imports_then_embeds_the_rest(world: World) -> None:
     world.corpora["it-n"] = _corpus("it-n", "loading", 5)
     world.documents["it-n"] = 5
-    world.imported = 4  # one document's text differs from the vector's: skipped by the import
+    world.text_mismatch = 1  # one document's text differs from the vector's: skipped by the import
     r = _invoke("embed-patents", "--corpus", "it-n", "--from-npy", "D:/ipc_knn/emb/paecter", "--ids",
-                "D:/ipc_knn/corpus.jsonl", "--batch", "2000")
+                "D:/ipc_knn/corpus.jsonl", "--batch", "2000", "--max-text-mismatch", "0.5")
     assert r.exit_code == 0, r.output
     assert world.names() == ["from_directory", "import_precomputed", "embed_corpus"]
     assert world.call("from_directory") == {"directory": Path("D:/ipc_knn/emb/paecter"),
                                             "id_list": Path("D:/ipc_knn/corpus.jsonl"), "with_texts": True}
     assert world.call("import_precomputed")["batch_size"] == 2000
-    assert json.loads(r.stdout)["state"] == "embedded"
+    out = json.loads(r.stdout)
+    assert out["state"] == "embedded"
+    assert (out["imported"], out["skipped_text_mismatch"], out["text_checked"]) == (4, 1, True)
+
+
+def test_embed_from_npy_stops_on_a_text_mismatch_above_the_threshold(world: World, settings: Settings) -> None:
+    """Wave 4 review: 2 of 100 documents (2% > 1%) differ from the vectors' text -> stop, don't re-embed on the GPU."""
+    world.corpora["it-m"] = _corpus("it-m", "loading", 100)
+    world.documents["it-m"] = 100
+    world.text_mismatch = 2
+    r = _invoke("embed-patents", "--corpus", "it-m", "--from-npy", "D:/x", "--ids", "D:/x/ids.jsonl")
+    assert r.exit_code == 1
+    assert "PrecomputedTextMismatch: 2 of 100 documents (2.00%)" in r.stderr
+    assert "threshold 1%" in r.stderr and "--max-text-mismatch" in r.stderr
+    assert "embed_corpus" not in world.names() and world.encoder_loads == []
+    m = _manifest(settings, "embed", "it-m")
+    assert (m["imported"], m["skipped_text_mismatch"], m["text_checked"]) == (98, 2, True)
+    assert m["error"] == "text mismatch above threshold"
+    # exactly at the threshold passes: 1 of 100 is not more than 1%
+    world.calls.clear()
+    world.text_mismatch = 1
+    world.embedded["it-m"] = 0
+    assert _invoke("embed-patents", "--corpus", "it-m", "--from-npy", "D:/x", "--ids", "D:/x/ids.jsonl").exit_code == 0
+    assert "embed_corpus" in world.names()
 
 
 def test_embed_from_npy_complete_needs_no_model(world: World) -> None:
@@ -447,11 +482,42 @@ def test_embed_from_npy_needs_ids(world: World) -> None:
 def test_embed_incomplete_exits_nonzero(world: World) -> None:
     world.corpora["it-i"] = _corpus("it-i", "loading", 5)
     world.documents["it-i"] = 5
-    world.imported = 3
+    world.text_mismatch = 2
     world.fail["encoder"] = PaecterError("D:/models/paecter is not a SentenceTransformer directory")
-    r = _invoke("embed-patents", "--corpus", "it-i", "--from-npy", "D:/x", "--ids", "D:/x/ids.jsonl")
+    r = _invoke("embed-patents", "--corpus", "it-i", "--from-npy", "D:/x", "--ids", "D:/x/ids.jsonl",
+                "--max-text-mismatch", "1")
     assert r.exit_code == 1
     assert "PaecterError: D:/models/paecter is not a SentenceTransformer directory" in r.stderr
+
+
+def test_embed_without_a_local_copy_fails_instead_of_hanging(world: World, settings: Settings,
+                                                             monkeypatch: pytest.MonkeyPatch) -> None:  # fmt: skip
+    """No --model-path, no PATENT_ENCODER_LOCAL_PATH, not cached, the hub stalls: a bounded wait, one clear line."""
+    import threading
+
+    from app.runtime import load_patent_encoder
+
+    release = threading.Event()
+
+    def snapshot(repo: str, **kw: Any) -> str:
+        if kw.get("local_files_only"):
+            raise FileNotFoundError("not cached")
+        release.wait(30)
+        return "never"
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", snapshot)
+    no_local = settings.model_copy(update={"patent_encoder_local_path": None, "patent_encoder_download_timeout_s": 0.2})
+    monkeypatch.setattr(cli, "get_settings", lambda: no_local)
+    assert cli._patent_encoder.__doc__ and load_patent_encoder.__module__ == "app.runtime"  # the real resolver runs
+    world.corpora["it-h"] = _corpus("it-h", "loading", 5)
+    world.documents["it-h"] = 5
+    try:
+        r = _invoke("embed-patents", "--corpus", "it-h")
+    finally:
+        release.set()
+    assert r.exit_code == 1
+    assert "PatentEncoderUnavailable" in r.stderr and "PATENT_ENCODER_LOCAL_PATH" in r.stderr
+    assert "embed_corpus" not in world.names() and world.encoder_loads == []
 
 
 # --- index / validate / activate / retire -------------------------------------------------------------------
@@ -648,19 +714,136 @@ def test_load_reingests_when_parameters_change_or_asked(world: World) -> None:
 
 
 def test_load_skips_ingest_and_embed_for_an_embedded_corpus(world: World) -> None:
-    world.corpora["it-load"] = _corpus("it-load", "embedded", 5)
-    world.documents["it-load"] = world.embedded["it-load"] = 5
+    """New rule (wave 4): an embedded corpus skips ingest only when its last completed ingest had these parameters."""
+    world.fail["index"] = PatentIndexError("disk full")  # first run: ingest + embed complete, stops at index
+    assert _invoke(*LOAD).exit_code == 1
+    assert world.corpora["it-load"].state == "embedded"
+    world.calls.clear()
     r = _invoke(*LOAD)
     assert r.exit_code == 0, r.output
     assert _services(world) == ["build_patent_index", "validate_corpus"]
+    steps = json.loads(r.stdout)["steps"]
+    assert steps[0]["status"] == "skipped" and "these parameters" in steps[0]["why"]
 
 
-def test_load_on_a_validated_corpus_does_nothing(world: World) -> None:
-    world.corpora["it-load"] = _corpus("it-load", "validated", 5, serving=True)
+def test_embedded_corpus_without_a_recorded_ingest_is_refused(world: World) -> None:
+    world.corpora["it-load"] = _corpus("it-load", "embedded", 5)
+    world.documents["it-load"] = world.embedded["it-load"] = 5
+    r = _invoke(*LOAD)
+    assert r.exit_code == 1
+    assert "PatentResumeRefused" in r.stderr and "no completed ingest is recorded" in r.stderr
+    assert "use --reingest or a new corpus id" in r.stderr
+    assert _services(world) == []
+    steps = json.loads(r.stdout)["steps"]
+    assert [(s["step"], s["status"]) for s in steps] == [("ingest", "refused")]
+
+
+def test_load_on_a_validated_corpus_with_the_same_parameters_does_nothing(world: World) -> None:
+    assert _invoke(*LOAD).exit_code == 0
+    world.corpora["it-load"] = replace(world.corpora["it-load"], is_serving=True)
+    world.calls.clear()
     r = _invoke(*LOAD)
     assert r.exit_code == 0, r.output
     assert _services(world) == []
     assert all(s["status"] == "skipped" for s in json.loads(r.stdout)["steps"])
+
+
+def test_smoke_load_does_not_pass_for_the_full_load(world: World) -> None:
+    """(a) A validated 400-record smoke corpus must not satisfy a 1M-record load of the same id."""
+    smoke = [a if a != "1000000" else "400" for a in LOAD]
+    assert _invoke(*smoke).exit_code == 0
+    assert world.corpora["it-load"].state == "validated"
+    world.calls.clear()
+    r = _invoke(*LOAD)
+    assert r.exit_code == 1
+    assert "parameters differ from the last completed ingest" in r.stderr
+    assert "limit: 400 -> 1000000" in r.stderr
+    assert _services(world) == []
+
+
+def test_crash_mid_ingest_is_not_mistaken_for_a_clean_corpus(world: World, settings: Settings) -> None:
+    """(b) Run A completes ingest (embed fails); run B with other parameters dies after writing documents; run A
+    again must re-ingest, not skip: B's pre-written manifest says completed=false."""
+    from app.services.patents.ingest import IngestError
+
+    world.fail["embed"] = PaecterError("CUDA error: out of memory")
+    assert _invoke(*LOAD).exit_code == 1
+    assert _manifest(settings, "ingest", "it-load")["completed"] is True
+    world.fail["ingest_after_write"] = IngestError("connection lost")
+    other = [a if a != "1000000" else "500000" for a in LOAD]
+    assert _invoke(*other).exit_code == 1
+    m = _manifest(settings, "ingest", "it-load")
+    assert m["completed"] is False and m["parameters"]["limit"] == 500000  # written before ingest() ran
+    world.calls.clear()
+    r = _invoke(*LOAD)
+    assert r.exit_code == 0, r.output
+    assert "ingest" in world.names()
+
+
+def test_live_count_differing_from_the_manifest_reingests(world: World) -> None:
+    """(b) The manifest is completed with these parameters, but the corpus now holds other rows: live count(*) wins
+    over the COALESCE'd patent_corpora.document_count."""
+    world.fail["embed"] = PaecterError("CUDA error: out of memory")
+    assert _invoke(*LOAD).exit_code == 1
+    world.documents["it-load"] += 3  # rows added outside this load; corpus.document_count still says 5
+    world.calls.clear()
+    world.live_counts = 0
+    r = _invoke(*LOAD)
+    assert r.exit_code == 0, r.output
+    assert "ingest" in world.names() and world.live_counts >= 1
+
+
+def test_pre_ingest_manifest_records_parameters(world: World, settings: Settings) -> None:
+    from app.services.patents.ingest import IngestError
+
+    world.fail["ingest"] = IngestError("the source yielded no records")
+    r = _invoke("ingest-patents", "--source", "hupd", "--corpus", "it-pre", "--years", "2017")
+    assert r.exit_code == 1
+    m = _manifest(settings, "ingest", "it-pre")
+    assert m["completed"] is False and m["parameters"]["source"] == "hupd" and "started_at" in m
+
+
+HUPD_LOAD = ["load-patents", "--source", "hupd", "--years", "2017", "--corpus", "it-c", *HNSW]
+
+
+@pytest.mark.parametrize(
+    ("change", "key"),
+    [
+        (["--label-ipc-edition", "2017.01"], "label_ipc_edition"),
+        (["--data-dir", "E:/elsewhere"], "data_dir"),
+        (["--no-concordance"], "concordance_applied"),
+        ("extra-concordance-file", "concordance_sources"),
+    ],
+)
+def test_parameters_compared_include_data_dir_edition_and_concordance(world: World, settings: Settings,
+                                                                      change: Any, key: str) -> None:  # fmt: skip
+    """(c) data_dir, label_ipc_edition, concordance applied and its source file names are part of the comparison."""
+    assert _invoke(*HUPD_LOAD).exit_code == 0
+    world.calls.clear()
+    if change == "extra-concordance-file":
+        (settings.source_dir / "wipo_ipc_concordance_20270101.zip").write_bytes(b"")
+        change = []
+    r = _invoke(*HUPD_LOAD, *change)
+    assert r.exit_code == 1, r.output
+    assert "parameters differ from the last completed ingest" in r.stderr and key in r.stderr
+    assert "ingest" not in world.names()
+    # --reingest is the explicit way through
+    r = _invoke(*HUPD_LOAD, *change, "--reingest")
+    assert "ingest" in world.names()
+
+
+def test_load_summary_shows_the_text_check(world: World) -> None:
+    r = _invoke(*LOAD[:-4], "--from-npy", "D:/x", "--ids", "D:/x/ids.jsonl", *HNSW)
+    assert r.exit_code == 0, r.output
+    embed = next(s for s in json.loads(r.stdout)["steps"] if s["step"] == "embed")
+    assert (embed["imported"], embed["skipped_text_mismatch"], embed["text_checked"]) == (5, 0, True)
+    world.calls.clear()
+    world.text_mismatch = 2
+    r = _invoke(*[a if a != "it-load" else "it-load2" for a in LOAD[:-4]], "--from-npy", "D:/x", "--ids",
+                "D:/x/ids.jsonl", *HNSW)
+    assert r.exit_code == 1
+    assert "stopped at step 'embed': PrecomputedTextMismatch: 2 of 5 documents" in r.stderr
+    assert _services(world)[-1] == "import_precomputed"
 
 
 def test_load_hupd_with_precomputed_vectors(world: World, settings: Settings) -> None:
@@ -738,35 +921,89 @@ def test_calibration_pipeline_is_definition_only(monkeypatch: pytest.MonkeyPatch
 
 
 def test_generate_pairs_classifies_on_the_definition_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Through the real ``Runtime._load`` and the real ``ClassificationPipeline``: with the vote enabled in the
+    settings, every pair-generation request takes the definition path (the vote attempt answers
+    ``neighbour_vote_disabled`` without touching the patent corpus), and PaECTER is never loaded. Only the model
+    loaders, the fingerprint's DB reads and the definition matching itself (needs the catalogue DB) are faked."""
+    from app import runtime as runtime_mod
+    from app.services.classification.pipeline import ClassificationPipeline
+    from app.services.embeddings.providers import EncodingPolicy
+
     s = Settings(_env_file=None, calibration_dir=tmp_path, neighbour_vote_enabled=True)
     monkeypatch.setattr(cli, "get_settings", lambda: s)
-    seen: list[bool] = []
+    policy = EncodingPolicy(provider="fake", model_id="fake/bge", model_revision="r", dimension=8,
+                            storage_table="ipc_embeddings", normalized=True, document_template="{text}",
+                            query_template="{text}", taxonomy_max_tokens=512, query_chunk_tokens=1024,
+                            dtype="float32")  # fmt: skip
+    monkeypatch.setattr("app.services.embeddings.providers.get_provider", lambda st: SimpleNamespace(policy=policy))
+    monkeypatch.setattr("app.services.classification.reranker.get_reranker",
+                        lambda st: SimpleNamespace(model_id="fake/rr", revision="1"))
+    monkeypatch.setattr("app.services.confidence.fingerprint.current_fingerprint", lambda st, p, r: ({}, "fp-served"))
 
-    class FakePipeline:
-        def __init__(self, settings: Settings) -> None:
-            self.s = settings
+    def no_encoder(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the calibration CLI must not load PaECTER")
 
-        def classify(self, session: Any, req: Any) -> Any:
-            seen.append(self.s.neighbour_vote_enabled)
-            return SimpleNamespace(candidates=[], alternatives=[])
+    monkeypatch.setattr(runtime_mod, "load_patent_encoder", no_encoder)
 
-    def fake_load(self: Any) -> None:
-        pipeline_settings = self.settings.model_copy(update={"neighbour_vote_enabled": False}) if \
-            self.definition_only else self.settings  # fmt: skip
-        self.pipeline, self.state, self.fingerprint, self.fingerprint_hash = FakePipeline(pipeline_settings), "ready", {}, "fp"
+    class StoreThatMustNotBeRead:
+        def serving_corpus(self, session: Any) -> Any:
+            raise AssertionError("the definition path must not look at the patent corpus")
+
+    reasons: list[str | None] = []
+    real_attempt = ClassificationPipeline._attempt_vote
+
+    def classify(self: ClassificationPipeline, session: Any, req: Any) -> Any:
+        self.patent_store = StoreThatMustNotBeRead()  # type: ignore[assignment]
+        attempt = real_attempt(self, session, req, {})  # the real decision, on the real pipeline settings
+        reasons.append(attempt.reason)
+        return SimpleNamespace(candidates=[], alternatives=[])  # definition matching needs the catalogue DB
 
     class _Session:
         def begin(self) -> Any:
             return contextlib.nullcontext()
 
-    monkeypatch.setattr("app.runtime.Runtime._load", fake_load)
+    monkeypatch.setattr(ClassificationPipeline, "classify", classify)
     monkeypatch.setattr("app.db.session.api_session", lambda: contextlib.nullcontext(_Session()))
     doc = {"abstract": "A quantum key distribution network.", "taxonomy_version": VERSION, "requested_level": "group",
            "split": "fit", "labels": [], "judgement_completeness": "complete", "document_id": "d1"}
-    monkeypatch.setattr("app.services.confidence.evaluation.load_eval_jsonl", lambda path: [doc])
+    monkeypatch.setattr("app.services.confidence.evaluation.load_eval_jsonl", lambda path: [doc, doc])
     r = _invoke("generate-pairs", "--eval-file", str(tmp_path / "eval.jsonl"), "--out", str(tmp_path / "pairs.jsonl"))
     assert r.exit_code == 0, r.output
-    assert seen == [False]
+    assert reasons == ["neighbour_vote_disabled", "neighbour_vote_disabled"]
+    header = json.loads((tmp_path / "pairs.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert header["fingerprint_hash"] == "fp-served"  # the served pipeline's fingerprint, not a definition-only one
+
+
+# The 1.x (vote disabled) fingerprint must not move: calibrators fitted before TASK-0011 stay compatible.
+# Computed with the pre-TASK-0011 fingerprint.py (67b7674) and the current one, same inputs as below: both give it.
+GOLDEN_1X_FINGERPRINT = "99c5f467985d0a8ba30d7f38b7b9c854ee4cdba3f866869d6d91e51cb9fa517d"
+
+
+def test_vote_disabled_fingerprint_matches_the_1x_golden_hash(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services.confidence import fingerprint as fp
+    from app.services.embeddings.providers import EncodingPolicy
+
+    for name in list(os.environ):
+        if name.upper().startswith(("NEIGHBOUR_", "PATENT_", "HNSW", "VECTOR_", "RERANK")):
+            monkeypatch.delenv(name)
+    policy = EncodingPolicy(provider="bge_m3", model_id="BAAI/bge-m3",
+                            model_revision="5617a9f61b028005a4858fdac845db406aefb181", dimension=1024,
+                            storage_table="ipc_embeddings", normalized=True, document_template="{text}",
+                            query_template="{text}", taxonomy_max_tokens=512, query_chunk_tokens=1024,
+                            dtype="float16")  # fmt: skip
+
+    class _S:
+        def execute(self, stmt: Any, params: Any = None) -> Any:
+            assert "embedding_runs" in str(stmt), f"vote disabled: no other query expected, got {stmt}"
+            return SimpleNamespace(first=lambda: ("run-input-hash",))
+
+    monkeypatch.setattr("app.db.session.api_session", lambda: contextlib.nullcontext(_S()))
+    monkeypatch.setattr("app.db.repository.active_release",
+                        lambda session: SimpleNamespace(taxonomy_version="20260101", source_hashes={"scheme": "s1"}))
+    _, h = fp.current_fingerprint(
+        Settings(_env_file=None, neighbour_vote_enabled=False), SimpleNamespace(policy=policy),
+        SimpleNamespace(model_id="BAAI/bge-reranker-v2-m3", revision="953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"))
+    assert h == GOLDEN_1X_FINGERPRINT
 
 
 # --- integration: advisory locks on a real database (opt-in) --------------------------------------------------
@@ -878,6 +1115,10 @@ def test_load_patents_end_to_end_on_a_tiny_hupd_corpus(monkeypatch: pytest.Monke
         # re-run: everything is done, nothing is repeated
         again = json.loads(runner.invoke(cli.app, args).stdout)
         assert all(s["status"] == "skipped" for s in again["steps"])
+        # other parameters on the validated corpus: refused before any write (wave 4 review)
+        bigger = runner.invoke(cli.app, [a if a != "400" else "800" for a in args])
+        assert bigger.exit_code == 1 and "parameters differ from the last completed ingest" in bigger.stderr
+        print(bigger.stderr.strip())
         status = json.loads(runner.invoke(cli.app, ["patent-status"]).stdout)
         mine = next(c for c in status["corpora"] if c["corpus_id"] == corpus_id)
         print(json.dumps(mine, default=str))

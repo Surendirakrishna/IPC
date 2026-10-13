@@ -136,6 +136,11 @@ class Settings(BaseSettings):
     neighbour_vote_enabled: bool = False
     patent_encoder_model_id: str = "mpi-inno-comp/paecter"
     patent_encoder_model_revision: str = "1f355d9e9a34dc4859e22d05ce27e970eeacfbd2"
+    # A local copy of PaECTER at that revision (checked against its weights hash). Set it on this network: the
+    # Hugging Face downloader stalls here. Without it the pinned snapshot is taken from the HF cache, else
+    # downloaded, bounded by PATENT_ENCODER_DOWNLOAD_TIMEOUT_S (then the vote stays unavailable, the fallback serves).
+    patent_encoder_local_path: Path | None = None
+    patent_encoder_download_timeout_s: float = Field(default=300.0, gt=0)
     # Vote parameters chosen on the IP India dev set with a 294k HUPD 2017 corpus (knn_hupd/report.json).
     neighbour_k: int = Field(default=100, ge=1, le=1000)
     neighbour_temperature: float = Field(default=0.005, gt=0)  # neighbour weight exp((s - s1) / T)
