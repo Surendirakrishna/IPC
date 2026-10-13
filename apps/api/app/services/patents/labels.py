@@ -12,7 +12,11 @@ Two source schemes:
   separate fields, so resolution is a normalisation.
 
 Labels whose symbol no longer exists (H01L, G06K 9/00, H04L 29/06 in 2026.01) fall back to the
-deepest level that still exists. Mapping them forward through the WIPO concordance is TASK-0015.
+deepest level that still exists. With a WIPO concordance (``concordance.load_concordance``, TASK-0015),
+a label that resolved MISSING, SUBCLASS_ONLY or MAINGROUP_ONLY is first mapped forward with
+``concordance.resolve(raw)``: the common ancestor of all its current targets (never more precise than they
+agree). If that gives a label, it replaces the fallback and counts as ``concordance``. EXACT and AMBIGUOUS
+labels name a current symbol (or several) and are never remapped.
 """
 
 from __future__ import annotations
@@ -53,12 +57,24 @@ class Outcome(StrEnum):
     SUBCLASS_ONLY = "subclass_only"
     AMBIGUOUS = "ambiguous"
     MISSING = "missing"  # subclass not in the catalogue, or the label could not be parsed
+    CONCORDANCE = "concordance"  # an abolished symbol, re-homed with the WIPO concordance
+
+
+# Outcomes a concordance may improve: the symbol (or its subclass) is not current. EXACT and AMBIGUOUS name
+# current symbols and are never remapped.
+REMAPPABLE = (Outcome.MISSING, Outcome.SUBCLASS_ONLY, Outcome.MAINGROUP_ONLY)
 
 
 class Concordance(Protocol):
-    """Old symbol -> current symbols (TASK-0015). Accepted by ``resolve_labels`` but not applied yet."""
+    """Abolished symbol -> current symbols (``concordance.WipoConcordance``, TASK-0015).
+
+    ``resolve`` is what a label votes for: the common ancestor of all its final targets, or None. ``apply``
+    only lists the in-catalogue targets; reducing those would invent precision, so resolution never uses it.
+    """
 
     def apply(self, code: str) -> list[str] | None: ...
+
+    def resolve(self, code: str) -> ResolvedLabel | None: ...
 
 
 @dataclass
@@ -68,6 +84,7 @@ class ResolutionStats:
     subclass_only: int = 0
     ambiguous: int = 0
     missing: int = 0
+    concordance: int = 0
 
     def count(self, outcome: Outcome) -> None:
         setattr(self, outcome.value, getattr(self, outcome.value) + 1)
@@ -249,6 +266,20 @@ def _label_key(raw: Any, scheme: Scheme) -> Any:
     )
 
 
+def _printed_symbol(fields: StructuredFields) -> str | None:
+    """A structured label as the printed symbol the concordance reads ("H01L 21/027", "H01L 21/00", "H01L")."""
+    sec, cls, sub, mg, sg = fields
+    subclass = _subclass(sec, cls, sub)
+    if subclass is None:
+        return None
+    mg_text, sg_text = _text(mg), _text(sg)
+    if not _is_digits(mg_text):
+        return subclass
+    if not _is_digits(sg_text):
+        return f"{subclass} {int(mg_text)}/00"
+    return f"{subclass} {int(mg_text)}/{_subgroup_candidates(sg_text)[0]}"
+
+
 def resolve_labels(
     raw_labels: Iterable[Any],
     scheme: Scheme,
@@ -261,11 +292,12 @@ def resolve_labels(
     section / class / subclass / main_group / subgroup (``ipc_``-prefixed keys accepted), 5-tuples
     in that order, or a single printed symbol ("H04L 12/18"). Statistics count each distinct raw
     label once; labels that resolve to nothing are counted as ``missing`` and left out.
+
+    With ``concordance``, a MISSING / SUBCLASS_ONLY / MAINGROUP_ONLY label is replaced by
+    ``concordance.resolve(raw)`` when that is not None, and counted as ``concordance`` instead.
     """
     if scheme not in ("compact", "structured"):
         raise ValueError(f"unknown label scheme {scheme!r}; expected 'compact' or 'structured'")
-    if concordance is not None:
-        raise NotImplementedError("concordance mapping of abolished codes is TASK-0015")
     result = LabelResolution()
     seen_raw: set[Any] = set()
     seen_labels: set[ResolvedLabel] = set()
@@ -276,9 +308,15 @@ def resolve_labels(
         seen_raw.add(key)
         if scheme == "compact":
             outcome, label = _compact_outcome(str(raw), catalogue)
+            symbol: str | None = str(raw)
         else:
             fields = _structured_fields(raw)
             outcome, label = (Outcome.MISSING, None) if fields is None else _structured_outcome(*fields, catalogue)
+            symbol = None if fields is None else _printed_symbol(fields)
+        if concordance is not None and outcome in REMAPPABLE and symbol is not None:
+            mapped = concordance.resolve(symbol)
+            if mapped is not None:
+                outcome, label = Outcome.CONCORDANCE, ResolvedLabel(*mapped)
         result.stats.count(outcome)
         if label is not None and label not in seen_labels:
             seen_labels.add(label)
