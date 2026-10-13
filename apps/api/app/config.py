@@ -12,7 +12,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 API_DIR = Path(__file__).resolve().parents[1]
@@ -129,6 +129,25 @@ class Settings(BaseSettings):
     apply_precedence_rules: bool = True
     apply_place_rules: bool = False
 
+    # --- Patent neighbour vote (ADR-0005) ------------------------------------
+    # The K most similar labelled patents vote for their IPC codes; the definition pipeline remains the
+    # fallback. Off by default: turning it on loads a second encoder (PaECTER) next to BGE-M3, and it only
+    # helps once a validated patent corpus is serving.
+    neighbour_vote_enabled: bool = False
+    patent_encoder_model_id: str = "mpi-inno-comp/paecter"
+    patent_encoder_model_revision: str = "1f355d9e9a34dc4859e22d05ce27e970eeacfbd2"
+    # Vote parameters chosen on the IP India dev set with a 294k HUPD 2017 corpus (knn_hupd/report.json).
+    neighbour_k: int = Field(default=100, ge=1, le=1000)
+    neighbour_temperature: float = Field(default=0.005, gt=0)  # neighbour weight exp((s - s1) / T)
+    neighbour_beta: float = Field(default=1.0, ge=0)  # weight of secondary labels; the main label counts 1
+    # Below this vote share for the first code, the definition pipeline runs as the fallback.
+    # PROVISIONAL: to be chosen on the dev set once the vote is served (offline, first-code shares under
+    # 0.2 matched about as often as definition matching does).
+    neighbour_min_vote_share: float = Field(default=0.2, ge=0, le=1)
+    patent_hnsw_ef_search: int = Field(default=200, ge=1)  # must be >= neighbour_k (checked below)
+    uspto_odp_api_key: SecretStr | None = None  # USPTO Open Data Portal; only needed to load USPTO grants
+    hupd_data_dir: Path = Path("D:/ipc_knn/raw/data")  # HUPD year tarballs (YYYY.tar.gz)
+
     # --- Request limits -------------------------------------------------
     max_abstract_chars: int = 10_000
     max_title_chars: int = 1_000
@@ -176,6 +195,23 @@ class Settings(BaseSettings):
             )
             return "sakthi"
         return v
+
+    @field_validator("uspto_odp_api_key", mode="before")
+    @classmethod
+    def _blank_key_is_unset(cls, v: object) -> object:
+        # A blank `USPTO_ODP_API_KEY=` line must read as "no key", not as an empty secret.
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
+    @model_validator(mode="after")
+    def _ef_search_covers_k(self) -> Settings:
+        # An HNSW scan returns at most ef_search rows, so a smaller value silently shrinks the vote.
+        if self.patent_hnsw_ef_search < self.neighbour_k:
+            raise ValueError(
+                f"PATENT_HNSW_EF_SEARCH ({self.patent_hnsw_ef_search}) must be >= NEIGHBOUR_K ({self.neighbour_k})"
+            )
+        return self
 
     def pooled_url(self) -> SecretStr | None:
         """URL for the API's bounded SQLAlchemy pool (no external pooler)."""
