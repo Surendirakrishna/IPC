@@ -4,6 +4,9 @@
 | :--- | :--- |
 | Classification (IPC) | <display code> — <confidence>; <next display code> — <confidence> |
 
+<confidence> is a calibrated percentage ("89.3%"), a raw neighbour vote share ("vote share: 79.1%"), or
+a "confidence: ..." status text; never a bare number without calibration.
+
 Built only from validated supported candidates (never alternatives). Markdown export escapes pipes
 and newlines. The UI renders the same `classification_lines` semantically (one line per code).
 """
@@ -17,8 +20,14 @@ DASH = "\u2014"
 
 
 def confidence_text(c: Confidence) -> str:
+    """Server-rendered wording per confidence.status (contract 2.0.0, docs/api.md); clients show it verbatim.
+
+    A raw neighbour vote share is a number but not a probability, so it is always labelled "vote share".
+    """
     if c.status == "calibrated" and c.score is not None:
         return f"{round(100 * c.score, 1)}%"
+    if c.status == "vote_share_uncalibrated" and c.score is not None:
+        return f"vote share: {round(100 * c.score, 1)}%"
     return {
         "not_calibrated": "confidence: not calibrated",
         "incompatible_artifact": "confidence: calibrator incompatible",
