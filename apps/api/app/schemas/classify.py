@@ -311,6 +311,8 @@ class VoteResult(_Response):
     def _first_share_present(self) -> VoteResult:
         if self.first_code_share.subclass is None:
             raise ValueError("vote.first_code_share.subclass is required")
+        if own_level_share(self.first_code_level, self.first_code_share) is None:
+            raise ValueError(f"vote.first_code_share needs a share at first_code_level ({self.first_code_level})")
         if len(self.neighbours) > self.neighbour_count:
             raise ValueError("vote.neighbours cannot exceed vote.neighbour_count")
         return self
@@ -417,6 +419,17 @@ class ClassifyResponse(_Response):
             raise ValueError("provenance.patent_encoder, patent_corpus and vote_settings are required with a vote")
         if self.vote is not None and p.vote_settings is not None and self.vote.neighbour_count > p.vote_settings.k:
             raise ValueError("vote.neighbour_count cannot exceed provenance.vote_settings.k")
+        if voted and self.vote is not None:
+            # The vote always yields its first code. It leads `candidates` unless an unconditional precedence
+            # rule demoted it (ADR-0004), in which case it is in `alternatives` and a supported code leads.
+            if not self.candidates:
+                raise ValueError("candidates must not be empty when classifier is 'neighbour_vote'")
+            first = self.vote.first_code
+            if self.candidates[0].display_code != first and all(a.display_code != first for a in self.alternatives):
+                raise ValueError(
+                    f"vote.first_code {first} must be candidates[0].display_code, or be in alternatives "
+                    "when a precedence rule demoted it"
+                )
         for c in self.candidates:
             if voted:
                 if c.vote_share.subclass is None:

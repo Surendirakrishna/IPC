@@ -75,7 +75,10 @@ is missing.
   | `incompatible_artifact` | `confidence: calibrator incompatible` |
   | `unsupported_input_mode` | `confidence: not calibrated for this input mode` |
 
-- `candidates[]`, in selection order (vote order when `classifier` is `neighbour_vote`). Each one has:
+- `candidates[]`, in selection order (vote order when `classifier` is `neighbour_vote`). With the
+  neighbour vote the list is never empty, and `candidates[0].display_code == vote.first_code`. The one
+  exception is when an unconditional precedence rule demoted the first code: it then appears in
+  `alternatives` and the supported code it yields to leads. Each candidate has:
   - `code`, `display_code`, `title`, `original_title` (nullable) and `level`;
   - `confidence {score|null, status, calibrator_id|null, interpretation|null, detail|null}`;
   - `vote_share {subclass|null, maingroup|null, exact|null}` (**2.0**), see below;
