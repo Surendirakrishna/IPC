@@ -177,6 +177,13 @@ def _require_writable(conn: Connection, corpus_id: str) -> None:
         )
 
 
+def _require_transactional(conn: Connection) -> None:
+    # The staging tables are ON COMMIT DELETE ROWS: under autocommit the COPY'd rows vanish before the
+    # INSERT ... SELECT reads them, and the batch would "succeed" having written nothing.
+    if conn.autocommit:
+        raise PatentCorpusError("batched writes need a transactional connection; autocommit is on")
+
+
 def _labels_json(labels: Sequence[Sequence[str | None]]) -> list[list[str | None]]:
     out = []
     for label in labels:
@@ -192,47 +199,55 @@ def upsert_documents(
     """Insert or update documents in batches (one commit per batch). Returns the number written.
 
     A document whose title or abstract changed loses its embedding, so it is embedded again. Within a
-    batch the last occurrence of a document id wins.
+    batch the last occurrence of a document id wins. A failed batch is rolled back and re-raised;
+    earlier batches stay committed.
     """
+    _require_transactional(conn)
     written = 0
     for batch in _batches(documents, batch_size):
-        _require_writable(conn, corpus_id)
         unique = list({d.document_id: d for d in batch}.values())
+        # Built and validated before _require_writable takes its row lock.
         rows = [
             (corpus_id, d.document_id, d.title, d.abstract, d.filing_date, d.publication_date,
              Jsonb(list(d.raw_labels)), Jsonb(_labels_json(d.resolved_labels)))
             for d in unique
         ]  # fmt: skip
-        with conn.cursor() as cur:
-            cur.execute(
-                "CREATE TEMP TABLE IF NOT EXISTS stage_patent_documents"
-                " (LIKE patent_documents INCLUDING DEFAULTS) ON COMMIT DELETE ROWS"
-            )
-            with cur.copy(
-                "COPY stage_patent_documents (corpus_id, document_id, title, abstract, filing_date,"
-                " publication_date, raw_labels, resolved_labels) FROM STDIN WITH (FORMAT BINARY)"
-            ) as copy:
-                copy.set_types(["text", "text", "text", "text", "date", "date", "jsonb", "jsonb"])
-                for row in rows:
-                    copy.write_row(row)
-            cur.execute(
-                "DELETE FROM patent_embeddings e USING stage_patent_documents s, patent_documents d"
-                " WHERE e.corpus_id = s.corpus_id AND e.document_id = s.document_id"
-                " AND d.corpus_id = s.corpus_id AND d.document_id = s.document_id"
-                " AND (d.title, d.abstract) IS DISTINCT FROM (s.title, s.abstract)"
-            )
-            cur.execute(
-                "INSERT INTO patent_documents (corpus_id, document_id, title, abstract, filing_date,"
-                " publication_date, raw_labels, resolved_labels)"
-                " SELECT corpus_id, document_id, title, abstract, filing_date, publication_date, raw_labels,"
-                " resolved_labels FROM stage_patent_documents"
-                " ON CONFLICT (corpus_id, document_id) DO UPDATE SET title = EXCLUDED.title,"
-                " abstract = EXCLUDED.abstract, filing_date = EXCLUDED.filing_date,"
-                " publication_date = EXCLUDED.publication_date, raw_labels = EXCLUDED.raw_labels,"
-                " resolved_labels = EXCLUDED.resolved_labels, updated_at = now()"
-            )
-        conn.commit()
-        written += len(rows)
+        try:
+            _require_writable(conn, corpus_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "CREATE TEMP TABLE IF NOT EXISTS stage_patent_documents"
+                    " (LIKE patent_documents INCLUDING DEFAULTS) ON COMMIT DELETE ROWS"
+                )
+                with cur.copy(
+                    "COPY stage_patent_documents (corpus_id, document_id, title, abstract, filing_date,"
+                    " publication_date, raw_labels, resolved_labels) FROM STDIN WITH (FORMAT BINARY)"
+                ) as copy:
+                    copy.set_types(["text", "text", "text", "text", "date", "date", "jsonb", "jsonb"])
+                    for row in rows:
+                        copy.write_row(row)
+                cur.execute(
+                    "DELETE FROM patent_embeddings e USING stage_patent_documents s, patent_documents d"
+                    " WHERE e.corpus_id = s.corpus_id AND e.document_id = s.document_id"
+                    " AND d.corpus_id = s.corpus_id AND d.document_id = s.document_id"
+                    " AND (d.title, d.abstract) IS DISTINCT FROM (s.title, s.abstract)"
+                )
+                cur.execute(
+                    "INSERT INTO patent_documents (corpus_id, document_id, title, abstract, filing_date,"
+                    " publication_date, raw_labels, resolved_labels)"
+                    " SELECT corpus_id, document_id, title, abstract, filing_date, publication_date, raw_labels,"
+                    " resolved_labels FROM stage_patent_documents"
+                    " ON CONFLICT (corpus_id, document_id) DO UPDATE SET title = EXCLUDED.title,"
+                    " abstract = EXCLUDED.abstract, filing_date = EXCLUDED.filing_date,"
+                    " publication_date = EXCLUDED.publication_date, raw_labels = EXCLUDED.raw_labels,"
+                    " resolved_labels = EXCLUDED.resolved_labels, updated_at = now()"
+                )
+                inserted = cur.rowcount
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        written += inserted
     return written
 
 
@@ -257,33 +272,43 @@ def insert_embeddings(
     """Store ``(document_id, vector)`` pairs as halfvec(1024), in batches (one commit per batch).
 
     Re-inserting a document's vector replaces it. Every document must already exist in the corpus
-    (foreign key). Returns the number written.
+    (foreign key). Returns the number written. A failed batch is rolled back and re-raised; earlier
+    batches stay committed.
     """
-    register_vector(conn)
+    _require_transactional(conn)
+    registered = False
     written = 0
     for batch in _batches(embeddings, batch_size):
-        _require_writable(conn, corpus_id)
         unique = {doc_id: vec for doc_id, vec in batch}
         rows = [(corpus_id, doc_id, _halfvec(doc_id, vec)) for doc_id, vec in unique.items()]
-        with conn.cursor() as cur:
-            cur.execute(
-                "CREATE TEMP TABLE IF NOT EXISTS stage_patent_embeddings"
-                " (LIKE patent_embeddings INCLUDING DEFAULTS) ON COMMIT DELETE ROWS"
-            )
-            with cur.copy(
-                "COPY stage_patent_embeddings (corpus_id, document_id, embedding) FROM STDIN WITH (FORMAT BINARY)"
-            ) as copy:
-                copy.set_types(["text", "text", "halfvec"])
-                for row in rows:
-                    copy.write_row(row)
-            cur.execute(
-                "INSERT INTO patent_embeddings (corpus_id, document_id, embedding)"
-                " SELECT corpus_id, document_id, embedding FROM stage_patent_embeddings"
-                " ON CONFLICT (corpus_id, document_id) DO UPDATE SET embedding = EXCLUDED.embedding,"
-                " created_at = now()"
-            )
-        conn.commit()
-        written += len(rows)
+        try:
+            _require_writable(conn, corpus_id)
+            if not registered:  # needs the halfvec type oid for binary COPY
+                register_vector(conn)
+                registered = True
+            with conn.cursor() as cur:
+                cur.execute(
+                    "CREATE TEMP TABLE IF NOT EXISTS stage_patent_embeddings"
+                    " (LIKE patent_embeddings INCLUDING DEFAULTS) ON COMMIT DELETE ROWS"
+                )
+                with cur.copy(
+                    "COPY stage_patent_embeddings (corpus_id, document_id, embedding) FROM STDIN WITH (FORMAT BINARY)"
+                ) as copy:
+                    copy.set_types(["text", "text", "halfvec"])
+                    for row in rows:
+                        copy.write_row(row)
+                cur.execute(
+                    "INSERT INTO patent_embeddings (corpus_id, document_id, embedding)"
+                    " SELECT corpus_id, document_id, embedding FROM stage_patent_embeddings"
+                    " ON CONFLICT (corpus_id, document_id) DO UPDATE SET embedding = EXCLUDED.embedding,"
+                    " created_at = now()"
+                )
+                inserted = cur.rowcount
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        written += inserted
     return written
 
 
