@@ -2,6 +2,8 @@
 
 import { useState } from "react";
 import { AlternativesPanel, CandidateCard } from "@/components/CandidateCard";
+import { FallbackNotice } from "@/components/FallbackNotice";
+import { SimilarPatents } from "@/components/SimilarPatents";
 import { SummaryTable } from "@/components/SummaryTable";
 import type { ApiErrorBody, ClassifyRequest, ClassifyResponse } from "@/lib/types";
 
@@ -146,6 +148,11 @@ export default function ClassifyPage() {
             {" "}({state.body.error})
           </p>
           <p>{state.body.message}</p>
+          {state.status === 503 && (
+            <p className="mt-1">
+              {state.body.error === "busy" ? "The service is busy; try again in a few seconds." : "Nothing can be classified right now; try again later."}
+            </p>
+          )}
         </div>
       )}
 
@@ -160,6 +167,7 @@ function Results({ result, fields }: { result: ClassifyResponse; fields: Record<
   return (
     <div className="space-y-4" data-testid="results">
       <SummaryTable result={result} />
+      <FallbackNotice result={result} />
       {result.field_of_invention.additional_labels.length > 0 && (
         <p className="text-sm">
           Additional fields: {result.field_of_invention.additional_labels.map((a) => `${a.label} (${a.from_code})`).join(", ")}
@@ -185,6 +193,8 @@ function Results({ result, fields }: { result: ClassifyResponse; fields: Record<
           {result.candidates.map((c) => <CandidateCard key={c.code} c={c} fields={fields} />)}
         </section>
       )}
+
+      <SimilarPatents result={result} />
 
       <AlternativesPanel alts={result.alternatives} fields={fields} />
 
