@@ -12,7 +12,7 @@ The brief named the tree file `ipc_schema_tree(2).json`. The supplied file is na
 `ipc_schema_tree.json`, and its hash matches the expected value. You can change the filename with
 `SOURCE_TREE_FILE`.
 
-`ipc validate-sources` measured the following (manifest: `data/manifests/validation_20260101.json`):
+`ipc validate-sources` measured the following (manifest: `data/manifests/imports/validation_20260101.json`):
 
 - 8 sections, 132 classes, 655 subclasses, 7,668 main groups and 71,682 subgroups.
 - `taxonomy_version` 20260101.

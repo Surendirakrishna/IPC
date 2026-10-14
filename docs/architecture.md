@@ -83,7 +83,7 @@ the EN file is parsed ([wipo.py](../apps/api/app/services/ingestion/wipo.py)).
   dominated places, with a `conditional` flag), `place_last`/`place_first` (scope), `limiting_reference`
   (cited places), and context-only kinds (`informative_reference`, `indexing`, `definition`, `scope`,
   `other`). Negated rules ("the last place priority rule is not applied") produce none. Counts for
-  2026.01 are in `data/manifests/validation_20260101.json`.
+  2026.01 are in `data/manifests/imports/validation_20260101.json`.
 
 ## Boundaries
 

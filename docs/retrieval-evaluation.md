@@ -61,7 +61,7 @@ specified.
 
 ### QKD smoke check (not calibration, not accuracy)
 
-`data/manifests/acceptance_qkd_local.json` holds the live response:
+`data/manifests/acceptance/acceptance_qkd_local.json` holds the live response:
 
 - `needs_review`, field COMMUNICATION (H04), supported H04L 9/08 "Key distribution".
 - Its quote is verified at `abstract[0:261]`.
@@ -104,7 +104,7 @@ In short, on the 130-application dev set:
 | --- | --- |
 | Run | `emb-gemma_api-e1b53a3633ed`, model `embeddinggemma-2` from the self-hosted endpoint |
 | Vectors | 80,145 / 80,145 validated, 768-dim, in `ipc_embeddings_gemma` (local only, no HNSW) |
-| BGE-M3 vs Gemma, exact top-100 overlap (101 queries) | mean 0.298, min 0.01, max 0.81 (`data/manifests/embedding_agreement_bge_vs_gemma.json`) |
+| BGE-M3 vs Gemma, exact top-100 overlap (101 queries) | mean 0.298, min 0.01, max 0.81 (`data/manifests/embeddings/embedding_agreement_bge_vs_gemma.json`) |
 | QKD abstract, exact rank of H04L 9/08 | BGE-M3: 64 · Gemma: 9 |
 | QKD abstract, exact rank of H04W 12/0433 | BGE-M3: 24 · Gemma: 5 |
 
